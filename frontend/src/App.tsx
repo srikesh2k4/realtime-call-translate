@@ -7,19 +7,14 @@ type Language = "en" | "hi";
 
 type WSMessage = {
   type?: "final";
-  sourceText?: string;
-  translatedText?: string;
+  text?: string;
+  translated?: string;
   audio?: string;
 };
 
-/* ================= AUDIO QUEUE ================= */
-
-type AudioItem =
-  | { kind: "pcm"; pcm: Float32Array }
-  | { kind: "tts"; b64: string };
-
 /* ================= CONFIG ================= */
 
+// Use same-origin WS (Vite proxy handles LAN + HTTPS)
 const WS_URL =
   `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 
@@ -28,14 +23,18 @@ const WS_URL =
 export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
 
+  /* ================= AUDIO ================= */
+
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
 
-  const audioQueueRef = useRef<AudioItem[]>([]);
+  const audioQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
 
   const [audioUnlocked, setAudioUnlocked] = useState(false);
   const [micLevel, setMicLevel] = useState(0);
+
+  /* ================= UI STATE ================= */
 
   const [room, setRoom] = useState("demo");
   const [lang, setLang] = useState<Language>("en");
@@ -48,9 +47,9 @@ export default function App() {
     "idle" | "listening" | "processing" | "speaking"
   >("idle");
 
-  const [seconds, setSeconds] = useState(0);
-
   /* ================= TIMER ================= */
+
+  const [seconds, setSeconds] = useState(0);
 
   useEffect(() => {
     if (!inCall) return;
@@ -66,60 +65,47 @@ export default function App() {
   /* ================= AUDIO CONTEXT ================= */
 
   const ensureAudioContext = async () => {
-    if (!audioCtxRef.current) {
+    if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
       audioCtxRef.current = new AudioContext({ sampleRate: 16000 });
     }
     await audioCtxRef.current.resume();
     setAudioUnlocked(true);
   };
 
-  /* ================= PLAYBACK ================= */
+  /* ================= TTS PLAYBACK ================= */
 
   const playNext = async () => {
-    if (isPlayingRef.current) return;
+    if (!audioUnlocked || isPlayingRef.current) return;
 
-    const item = audioQueueRef.current.shift();
-    if (!item) {
-      setStatus("listening");
-      return;
-    }
+    const base64 = audioQueueRef.current.shift();
+    if (!base64) return;
 
-    const ctx = audioCtxRef.current!;
     isPlayingRef.current = true;
     setStatus("speaking");
 
     try {
-      if (item.kind === "pcm") {
-        const buffer = ctx.createBuffer(1, item.pcm.length, 16000);
-        buffer.copyToChannel(item.pcm, 0);
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(ctx.destination);
-        src.onended = () => {
-          isPlayingRef.current = false;
-          playNext();
-        };
-        src.start();
-      } else {
-        const bytes = Uint8Array.from(atob(item.b64), c => c.charCodeAt(0));
-        const buffer = await ctx.decodeAudioData(bytes.buffer);
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(ctx.destination);
-        src.onended = () => {
-          isPlayingRef.current = false;
-          playNext();
-        };
-        src.start();
-      }
+      const ctx = audioCtxRef.current!;
+      const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+      const buffer = await ctx.decodeAudioData(bytes.buffer);
+
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+
+      src.onended = () => {
+        isPlayingRef.current = false;
+        setStatus("idle");
+        playNext();
+      };
+
+      src.start();
     } catch {
       isPlayingRef.current = false;
-      playNext();
     }
   };
 
-  const enqueueAudio = (item: AudioItem) => {
-    audioQueueRef.current.push(item);
+  const enqueueAudio = (b64: string) => {
+    audioQueueRef.current.push(b64);
     playNext();
   };
 
@@ -128,12 +114,12 @@ export default function App() {
   const startCall = async () => {
     if (inCall || !audioUnlocked) return;
 
-    await ensureAudioContext();
-
     setSeconds(0);
     setRecognized("");
     setTranslated("");
     setStatus("listening");
+
+    await ensureAudioContext();
 
     const ws = new WebSocket(WS_URL);
     ws.binaryType = "arraybuffer";
@@ -151,19 +137,14 @@ export default function App() {
       const mic = ctx.createMediaStreamSource(stream);
       mic.connect(analyserRef.current);
 
-      /* ---- mic RMS level ---- */
-      const timeData = new Uint8Array(analyserRef.current.fftSize);
-      const levelLoop = () => {
-        analyserRef.current?.getByteTimeDomainData(timeData);
-        let sum = 0;
-        for (const v of timeData) {
-          const d = (v - 128) / 128;
-          sum += d * d;
-        }
-        setMicLevel(Math.sqrt(sum / timeData.length));
-        requestAnimationFrame(levelLoop);
+      /* ---- mic level animation ---- */
+      const data = new Uint8Array(analyserRef.current.frequencyBinCount);
+      const loop = () => {
+        analyserRef.current?.getByteFrequencyData(data);
+        setMicLevel(data.reduce((a, b) => a + b, 0) / data.length);
+        requestAnimationFrame(loop);
       };
-      levelLoop();
+      loop();
 
       /* ---- audio worklet ---- */
       await ctx.audioWorklet.addModule("/audio-worklet.js");
@@ -171,7 +152,7 @@ export default function App() {
 
       let buffers: Float32Array[] = [];
       let size = 0;
-      const TARGET = 8192;
+      const TARGET = 5120;
 
       worklet.port.onmessage = e => {
         if (!(e.data instanceof Float32Array)) return;
@@ -182,10 +163,10 @@ export default function App() {
 
         if (size >= TARGET) {
           const merged = new Float32Array(size);
-          let off = 0;
+          let offset = 0;
           for (const b of buffers) {
-            merged.set(b, off);
-            off += b.length;
+            merged.set(b, offset);
+            offset += b.length;
           }
           ws.send(merged.buffer);
           buffers = [];
@@ -199,22 +180,33 @@ export default function App() {
 
     /* ================= RECEIVE ================= */
 
-    ws.onmessage = e => {
+    ws.onmessage = async e => {
+      const ctx = audioCtxRef.current!;
+
+      // 🔵 SAME LANGUAGE → RAW PCM AUDIO
       if (e.data instanceof ArrayBuffer) {
-        enqueueAudio({ kind: "pcm", pcm: new Float32Array(e.data) });
+        const pcm = new Float32Array(e.data);
+        const buffer = ctx.createBuffer(1, pcm.length, 16000);
+        buffer.copyToChannel(pcm, 0);
+
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        src.connect(ctx.destination);
+        src.start();
         return;
       }
 
+      // 🟢 DIFFERENT LANGUAGE → TRANSLATED JSON
       const msg: WSMessage = JSON.parse(e.data);
       if (msg.type !== "final") return;
 
       setStatus("processing");
-      msg.sourceText && setRecognized(msg.sourceText);
-      msg.translatedText && setTranslated(msg.translatedText);
-      msg.audio && enqueueAudio({ kind: "tts", b64: msg.audio });
+      msg.text && setRecognized(msg.text);
+      msg.translated && setTranslated(msg.translated);
+      msg.audio && enqueueAudio(msg.audio);
     };
 
-    ws.onerror = () => console.warn("WebSocket error");
+    ws.onerror = stopCall;
     ws.onclose = stopCall;
   };
 
@@ -227,7 +219,8 @@ export default function App() {
     audioQueueRef.current = [];
     isPlayingRef.current = false;
 
-    audioCtxRef.current?.suspend();
+    audioCtxRef.current?.close();
+    audioCtxRef.current = null;
 
     setInCall(false);
     setStatus("idle");
@@ -267,6 +260,11 @@ export default function App() {
                 </button>
               </div>
 
+              <p style={styles.hint}>
+                You will hear translations in{" "}
+                <b>{lang === "en" ? "English" : "Hindi"}</b>
+              </p>
+
               <button style={styles.secondary} onClick={ensureAudioContext}>
                 Enable Audio
               </button>
@@ -284,17 +282,23 @@ export default function App() {
           {inCall && (
             <>
               <div style={styles.timer}>{formatTime()}</div>
+
               <motion.div
                 style={styles.mic}
-                animate={{ scale: 1 + micLevel * 2 }}
+                animate={{ scale: 1 + micLevel / 300 }}
               />
-              <p style={styles.status}>{status}</p>
+
+              <p style={styles.status}>
+                {status === "listening" && "Listening…"}
+                {status === "processing" && "Translating…"}
+                {status === "speaking" && "Speaking…"}
+              </p>
 
               <div style={styles.transcript}>
                 <b>Recognized</b>
                 <p>{recognized}</p>
                 <hr />
-                <b>Translated</b>
+                <b>Translated (You hear)</b>
                 <p>{translated}</p>
               </div>
 
@@ -327,6 +331,7 @@ const styles: any = {
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
+    padding: 16,
   },
   card: {
     width: "100%",
@@ -335,30 +340,40 @@ const styles: any = {
     borderRadius: 24,
     padding: 24,
     color: "white",
+    boxShadow: "0 20px 40px rgba(0,0,0,.6)",
   },
   title: { textAlign: "center", marginBottom: 12 },
   input: {
     width: "100%",
     padding: 12,
     borderRadius: 12,
+    border: "none",
     marginBottom: 12,
   },
-  row: { display: "flex", gap: 8 },
+  row: { display: "flex", gap: 8, marginBottom: 8 },
+  hint: {
+    textAlign: "center",
+    opacity: 0.7,
+    marginBottom: 12,
+    fontSize: 13,
+  },
   secondary: {
     width: "100%",
     padding: 12,
     background: "#0ea5e9",
     borderRadius: 12,
-    marginTop: 8,
+    border: "none",
+    marginBottom: 8,
   },
   primary: {
     width: "100%",
     padding: 14,
     background: "#22c55e",
     borderRadius: 14,
-    marginTop: 8,
+    border: "none",
+    fontWeight: 700,
   },
-  timer: { textAlign: "center", fontSize: 18 },
+  timer: { textAlign: "center", fontSize: 18, marginBottom: 8 },
   mic: {
     width: 60,
     height: 60,
@@ -366,7 +381,7 @@ const styles: any = {
     background: "#22c55e",
     margin: "12px auto",
   },
-  status: { textAlign: "center" },
+  status: { textAlign: "center", opacity: 0.8 },
   transcript: {
     background: "#020617",
     padding: 12,
@@ -378,5 +393,7 @@ const styles: any = {
     padding: 14,
     background: "#ef4444",
     borderRadius: 14,
+    border: "none",
+    fontWeight: 700,
   },
 };
