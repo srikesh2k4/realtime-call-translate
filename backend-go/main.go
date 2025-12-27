@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -21,7 +22,7 @@ type Client struct {
 	room   string
 	lang   string
 	send   chan []byte
-	mlBusy bool
+	mlBusy int32
 }
 
 type JoinMessage struct {
@@ -30,11 +31,12 @@ type JoinMessage struct {
 }
 
 type MLResponse struct {
-	Type       string `json:"type"`
-	Text       string `json:"text"`
-	Translated string `json:"translated"`
-	Audio      string `json:"audio"`
-	TargetLang string `json:"targetLang"`
+	Type           string `json:"type"`
+	SourceText     string `json:"sourceText"`
+	TranslatedText string `json:"translatedText"`
+	Audio          string `json:"audio"`
+	SourceLang     string `json:"sourceLang"`
+	TargetLang     string `json:"targetLang"`
 }
 
 /* ================= AUDIO ================= */
@@ -58,7 +60,8 @@ var (
 
 	httpClient = &http.Client{Timeout: 120 * time.Second}
 
-	WINDOW_SAMPLES = 16000 * 6
+	// MUST MATCH BACKEND (2.5s @ 16k)
+	WINDOW_SAMPLES = 16000 * 25 / 10
 )
 
 /* ================= WS HANDLER ================= */
@@ -71,7 +74,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 	client := &Client{
 		conn: conn,
-		send: make(chan []byte, 32),
+		send: make(chan []byte, 64),
 	}
 
 	mu.Lock()
@@ -93,7 +96,6 @@ func readPump(c *Client) {
 			return
 		}
 
-		// Join message
 		if msgType == websocket.TextMessage {
 			var join JoinMessage
 			if json.Unmarshal(data, &join) == nil {
@@ -102,14 +104,13 @@ func readPump(c *Client) {
 			continue
 		}
 
-		// Audio
 		if msgType == websocket.BinaryMessage {
 			handleAudio(c, data)
 		}
 	}
 }
 
-/* ================= AUDIO HANDLING ================= */
+/* ================= AUDIO ================= */
 
 func handleAudio(c *Client, data []byte) {
 	if len(data)%4 != 0 {
@@ -125,23 +126,25 @@ func handleAudio(c *Client, data []byte) {
 	state := audioBuffers[c]
 	state.samples = append(state.samples, samples...)
 
-	if len(state.samples) >= WINDOW_SAMPLES && !c.mlBusy {
-		audio := make([]float32, WINDOW_SAMPLES)
-		copy(audio, state.samples[:WINDOW_SAMPLES])
-		state.samples = state.samples[WINDOW_SAMPLES:]
-		c.mlBusy = true
+	if len(state.samples) < WINDOW_SAMPLES || atomic.LoadInt32(&c.mlBusy) == 1 {
 		mu.Unlock()
-
-		go forward(c, audio)
 		return
 	}
 
+	audio := make([]float32, WINDOW_SAMPLES)
+	copy(audio, state.samples[:WINDOW_SAMPLES])
+	state.samples = state.samples[WINDOW_SAMPLES:]
+	atomic.StoreInt32(&c.mlBusy, 1)
 	mu.Unlock()
+
+	go forward(c, audio)
 }
 
-/* ================= WRITE LOOP ================= */
+/* ================= WRITE ================= */
 
 func writePump(c *Client) {
+	defer c.conn.Close()
+
 	for msg := range c.send {
 		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 			return
@@ -149,7 +152,7 @@ func writePump(c *Client) {
 	}
 }
 
-/* ================= ROOM ================= */
+/* ================= ROOMS ================= */
 
 func joinRoom(c *Client, room, lang string) {
 	mu.Lock()
@@ -163,7 +166,7 @@ func joinRoom(c *Client, room, lang string) {
 	c.lang = lang
 	rooms[room][c] = true
 
-	log.Println("Joined room:", room, "lang:", lang)
+	log.Println("Joined:", room, "lang:", lang)
 }
 
 /* ================= CLEANUP ================= */
@@ -176,21 +179,16 @@ func cleanup(c *Client) {
 	if c.room != "" {
 		delete(rooms[c.room], c)
 	}
-
 	close(c.send)
 	_ = c.conn.Close()
 }
 
-/* ================= FORWARD LOGIC ================= */
+/* ================= FORWARD ================= */
 
 func forward(sender *Client, pcm []float32) {
-	defer func() {
-		mu.Lock()
-		sender.mlBusy = false
-		mu.Unlock()
-	}()
+	defer atomic.StoreInt32(&sender.mlBusy, 0)
 
-	/* ---------- SAME LANGUAGE → RAW AUDIO ---------- */
+	/* ---------- RAW AUDIO (SAME LANG) ---------- */
 
 	mu.RLock()
 	for peer := range rooms[sender.room] {
@@ -202,7 +200,23 @@ func forward(sender *Client, pcm []float32) {
 	}
 	mu.RUnlock()
 
-	/* ---------- DIFFERENT LANGUAGE → ML ---------- */
+	/* ---------- CHECK IF ML IS NEEDED ---------- */
+
+	needML := false
+	mu.RLock()
+	for peer := range rooms[sender.room] {
+		if peer.lang != sender.lang {
+			needML = true
+			break
+		}
+	}
+	mu.RUnlock()
+
+	if !needML {
+		return
+	}
+
+	/* ---------- ML REQUEST ---------- */
 
 	buf := new(bytes.Buffer)
 	_ = binary.Write(buf, binary.LittleEndian, pcm)
@@ -216,7 +230,6 @@ func forward(sender *Client, pcm []float32) {
 		"http://127.0.0.1:9001/process",
 		buf,
 	)
-
 	req.Header.Set("X-Room", sender.room)
 	req.Header.Set("X-Speaker-Lang", sender.lang)
 
@@ -237,7 +250,7 @@ func forward(sender *Client, pcm []float32) {
 		return
 	}
 
-	/* ---------- SEND TRANSLATED JSON ---------- */
+	/* ---------- DISPATCH ---------- */
 
 	mu.RLock()
 	defer mu.RUnlock()
