@@ -1,4 +1,9 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
+
+/* ================= TYPES ================= */
+
+type Language = "en" | "hi";
 
 type WSMessage = {
   type?: "final";
@@ -7,26 +12,48 @@ type WSMessage = {
   audio?: string;
 };
 
+/* ================= APP ================= */
+
 export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
 
-  /* ================= AUDIO STATE ================= */
+  /* ================= AUDIO ================= */
 
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
   const audioQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
-  const audioCtxRef = useRef<AudioContext | null>(null);
 
   const [audioUnlocked, setAudioUnlocked] = useState(false);
+  const [micLevel, setMicLevel] = useState(0);
 
   /* ================= UI STATE ================= */
 
   const [room, setRoom] = useState("demo");
-  const [mode, setMode] = useState<0 | 1>(0);
-  const [isSpeaker, setIsSpeaker] = useState(true);
+  const [lang, setLang] = useState<Language>("en"); // language I want to hear
   const [inCall, setInCall] = useState(false);
 
-  const [text, setText] = useState("");
+  const [recognized, setRecognized] = useState("");
   const [translated, setTranslated] = useState("");
+
+  const [status, setStatus] = useState<
+    "idle" | "listening" | "processing" | "speaking"
+  >("idle");
+
+  /* ================= TIMER ================= */
+
+  const [seconds, setSeconds] = useState(0);
+
+  useEffect(() => {
+    if (!inCall) return;
+    const t = setInterval(() => setSeconds(s => s + 1), 1000);
+    return () => clearInterval(t);
+  }, [inCall]);
+
+  const formatTime = () =>
+    `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(
+      seconds % 60
+    ).padStart(2, "0")}`;
 
   /* ================= AUDIO UNLOCK ================= */
 
@@ -34,19 +61,14 @@ export default function App() {
     if (!audioCtxRef.current) {
       audioCtxRef.current = new AudioContext();
     }
-
     if (audioCtxRef.current.state === "suspended") {
       await audioCtxRef.current.resume();
     }
-
     setAudioUnlocked(true);
-    console.log("🔓 Audio unlocked");
-
-    // 🔥 If audio already queued, start playing
     playNext();
   };
 
-  /* ================= AUDIO QUEUE ================= */
+  /* ================= AUDIO PLAYBACK ================= */
 
   const playNext = async () => {
     if (!audioUnlocked) return;
@@ -55,32 +77,32 @@ export default function App() {
 
     const base64 = audioQueueRef.current.shift()!;
     isPlayingRef.current = true;
+    setStatus("speaking");
 
     try {
-      const audioCtx = audioCtxRef.current!;
-      const binary = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-      const buffer = await audioCtx.decodeAudioData(binary.buffer);
+      const ctx = audioCtxRef.current!;
+      const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+      const buffer = await ctx.decodeAudioData(bytes.buffer);
 
-      const source = audioCtx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(audioCtx.destination);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
 
-      source.onended = () => {
+      src.onended = () => {
         isPlayingRef.current = false;
+        setStatus("idle");
         playNext();
       };
 
-      source.start(0);
-    } catch (e) {
-      console.error("❌ WebAudio decode/play failed", e);
+      src.start();
+    } catch {
       isPlayingRef.current = false;
       playNext();
     }
   };
 
-  const enqueueAudio = (base64: string) => {
-    console.log("🔊 Audio enqueued", base64.length);
-    audioQueueRef.current.push(base64);
+  const enqueueAudio = (b64: string) => {
+    audioQueueRef.current.push(b64);
     playNext();
   };
 
@@ -89,33 +111,48 @@ export default function App() {
   const startCall = async () => {
     if (inCall) return;
 
+    setSeconds(0);
+    setRecognized("");
+    setTranslated("");
+    setStatus("listening");
+
     const ws = new WebSocket("ws://localhost:8000/ws");
     wsRef.current = ws;
 
     ws.onopen = async () => {
-      ws.send(JSON.stringify({ room, mode, isSpeaker }));
-
-      if (!isSpeaker) {
-        setInCall(true);
-        return;
-      }
+      ws.send(JSON.stringify({ room, lang }));
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-      const audioCtx = new AudioContext({ sampleRate: 16000 });
-      audioCtxRef.current = audioCtx;
-      await audioCtx.resume();
+      const ctx = new AudioContext({ sampleRate: 16000 });
+      audioCtxRef.current = ctx;
+      await ctx.resume();
 
-      await audioCtx.audioWorklet.addModule("/audio-worklet.js");
+      analyserRef.current = ctx.createAnalyser();
+      analyserRef.current.fftSize = 256;
 
-      const source = audioCtx.createMediaStreamSource(stream);
-      const worklet = new AudioWorkletNode(audioCtx, "pcm-processor");
+      const mic = ctx.createMediaStreamSource(stream);
+      mic.connect(analyserRef.current);
 
-      const TARGET = 5120;
+      /* ---- mic level animation ---- */
+      const data = new Uint8Array(analyserRef.current.frequencyBinCount);
+      const loop = () => {
+        analyserRef.current?.getByteFrequencyData(data);
+        const avg = data.reduce((a, b) => a + b, 0) / data.length;
+        setMicLevel(avg);
+        requestAnimationFrame(loop);
+      };
+      loop();
+
+      /* ---- audio worklet ---- */
+      await ctx.audioWorklet.addModule("/audio-worklet.js");
+      const worklet = new AudioWorkletNode(ctx, "pcm-processor");
+
       let buffers: Float32Array[] = [];
       let size = 0;
+      const TARGET = 5120;
 
-      worklet.port.onmessage = (e) => {
+      worklet.port.onmessage = e => {
         if (!(e.data instanceof Float32Array)) return;
         if (ws.readyState !== WebSocket.OPEN) return;
 
@@ -135,19 +172,19 @@ export default function App() {
         }
       };
 
-      source.connect(worklet);
+      mic.connect(worklet);
       setInCall(true);
     };
 
-    ws.onmessage = (e) => {
+    ws.onmessage = e => {
       if (typeof e.data !== "string") return;
 
       const msg: WSMessage = JSON.parse(e.data);
       if (msg.type !== "final") return;
 
-      if (msg.text) setText(msg.text);
+      setStatus("processing");
+      if (msg.text) setRecognized(msg.text);
       if (msg.translated) setTranslated(msg.translated);
-
       if (msg.audio) enqueueAudio(msg.audio);
     };
 
@@ -155,84 +192,94 @@ export default function App() {
     ws.onclose = stopCall;
   };
 
-  /* ================= STOP CALL ================= */
+  /* ================= STOP ================= */
 
   const stopCall = () => {
     wsRef.current?.close();
     wsRef.current = null;
-
     audioQueueRef.current = [];
-    isPlayingRef.current = false;
-
-    audioCtxRef.current?.close();
-    audioCtxRef.current = null;
-
     setInCall(false);
-    setText("");
-    setTranslated("");
+    setStatus("idle");
+    setSeconds(0);
   };
 
   /* ================= UI ================= */
 
   return (
     <div style={styles.page}>
-      <div style={styles.card}>
-        <h2>📞 Live Call Translation</h2>
+      <AnimatePresence mode="wait">
+        <motion.div
+          key={inCall ? "call" : "home"}
+          initial={{ opacity: 0, y: 30 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -30 }}
+          transition={{ duration: 0.3 }}
+          style={styles.card}
+        >
+          <h2 style={styles.title}>Two-Way Live Translator</h2>
 
-        {!inCall && (
-          <>
-            <input
-              value={room}
-              onChange={(e) => setRoom(e.target.value)}
-              placeholder="Room ID"
-              style={styles.input}
-            />
+          {!inCall && (
+            <>
+              <input
+                value={room}
+                onChange={e => setRoom(e.target.value)}
+                placeholder="Room ID"
+                style={styles.input}
+              />
 
-            <div style={{ display: "flex", gap: 8 }}>
-              <button style={btn(mode === 0)} onClick={() => setMode(0)}>
-                EN → HI
+              <div style={styles.row}>
+                <button style={btn(lang === "en")} onClick={() => setLang("en")}>
+                  Hear English
+                </button>
+                <button style={btn(lang === "hi")} onClick={() => setLang("hi")}>
+                  Hear Hindi
+                </button>
+              </div>
+
+              <p style={styles.hint}>
+                You will hear translations in <b>{lang === "en" ? "English" : "Hindi"}</b>
+              </p>
+
+              <button style={styles.secondary} onClick={unlockAudio}>
+                Enable Audio
               </button>
-              <button style={btn(mode === 1)} onClick={() => setMode(1)}>
-                HI → EN
+
+              <button style={styles.primary} onClick={startCall}>
+                Start Call
               </button>
-            </div>
+            </>
+          )}
 
-            <button
-              style={styles.modeBtn}
-              onClick={() => setIsSpeaker(!isSpeaker)}
-            >
-              {isSpeaker ? "🎤 Speaker" : "🔊 Listener"}
-            </button>
+          {inCall && (
+            <>
+              <div style={styles.timer}>{formatTime()}</div>
 
-            <button
-              style={{ ...styles.callBtn, background: "#0ea5e9" }}
-              onClick={unlockAudio}
-            >
-              🔓 Enable Audio
-            </button>
+              <motion.div
+                style={styles.mic}
+                animate={{ scale: 1 + micLevel / 300 }}
+              />
 
-            <button style={styles.callBtn} onClick={startCall}>
-              📞 Start Call
-            </button>
-          </>
-        )}
+              <p style={styles.status}>
+                {status === "listening" && "Listening…"}
+                {status === "processing" && "Translating…"}
+                {status === "speaking" && "Speaking…"}
+              </p>
 
-        {inCall && (
-          <>
-            <div style={styles.transcript}>
-              <b>Recognized</b>
-              <p>{text}</p>
-              <hr />
-              <b>Translated</b>
-              <p>{translated}</p>
-            </div>
+              <div style={styles.transcript}>
+                <b>Recognized</b>
+                <p>{recognized}</p>
+                <hr />
+                <b>Translated (You hear)</b>
+                <p>{translated}</p>
+              </div>
 
-            <button style={styles.endBtn} onClick={stopCall}>
-              ⛔ End Call
-            </button>
-          </>
-        )}
-      </div>
+              <button style={styles.end} onClick={stopCall}>
+                End Call
+              </button>
+            </>
+          )}
+        </motion.div>
+      </AnimatePresence>
     </div>
   );
 }
@@ -241,62 +288,97 @@ export default function App() {
 
 const btn = (active: boolean) => ({
   flex: 1,
-  padding: 10,
-  borderRadius: 8,
+  padding: 12,
+  borderRadius: 12,
   border: "none",
-  background: active ? "#22c55e" : "#334155",
+  background: active ? "#22c55e" : "#1e293b",
   color: "white",
 });
 
 const styles: any = {
   page: {
-    height: "100vh",
-    background: "#0f172a",
-    color: "white",
+    minHeight: "100vh",
+    background: "#020617",
     display: "flex",
-    justifyContent: "center",
     alignItems: "center",
+    justifyContent: "center",
+    padding: 16,
   },
   card: {
-    width: 360,
+    width: "100%",
+    maxWidth: 420,
     background: "#020617",
-    borderRadius: 20,
+    borderRadius: 24,
     padding: 24,
+    color: "white",
+    boxShadow: "0 20px 40px rgba(0,0,0,.6)",
+  },
+  title: {
+    textAlign: "center",
+    marginBottom: 12,
   },
   input: {
     width: "100%",
-    padding: 10,
-    borderRadius: 8,
-    marginBottom: 12,
+    padding: 12,
+    borderRadius: 12,
     border: "none",
+    marginBottom: 12,
+  },
+  row: {
+    display: "flex",
+    gap: 8,
+    marginBottom: 8,
+  },
+  hint: {
+    textAlign: "center",
+    opacity: 0.7,
+    marginBottom: 12,
+    fontSize: 13,
+  },
+  secondary: {
+    width: "100%",
+    padding: 12,
+    background: "#0ea5e9",
+    borderRadius: 12,
+    border: "none",
+    marginBottom: 8,
+  },
+  primary: {
+    width: "100%",
+    padding: 14,
+    background: "#22c55e",
+    borderRadius: 14,
+    border: "none",
+    fontWeight: 700,
+  },
+  timer: {
+    textAlign: "center",
+    fontSize: 18,
+    marginBottom: 8,
+  },
+  mic: {
+    width: 60,
+    height: 60,
+    borderRadius: "50%",
+    background: "#22c55e",
+    margin: "12px auto",
+  },
+  status: {
+    textAlign: "center",
+    opacity: 0.8,
   },
   transcript: {
     background: "#020617",
     padding: 12,
-    borderRadius: 8,
+    borderRadius: 12,
     marginBottom: 12,
   },
-  callBtn: {
+  end: {
     width: "100%",
     padding: 14,
-    borderRadius: 12,
-    background: "#22c55e",
-    border: "none",
-    marginTop: 10,
-  },
-  endBtn: {
-    width: "100%",
-    padding: 14,
-    borderRadius: 12,
     background: "#ef4444",
+    borderRadius: 14,
     border: "none",
-  },
-  modeBtn: {
-    width: "100%",
-    padding: 10,
-    borderRadius: 8,
-    background: "#334155",
-    border: "none",
-    marginTop: 8,
+    fontWeight: 700,
   },
 };

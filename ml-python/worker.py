@@ -3,141 +3,122 @@ import io
 import os
 import numpy as np
 import soundfile as sf
-from collections import defaultdict
-
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# ================= ENV =================
+# ================= SETUP =================
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI()
 
-# ================= CONSTANTS =================
-
 SAMPLE_RATE = 16000
 WINDOW_SECONDS = 6
 WINDOW_SAMPLES = SAMPLE_RATE * WINDOW_SECONDS
 
-# ================= STATE =================
 # room -> list[np.ndarray]
-buffers = defaultdict(list)
+buffers = {}
 
 # ================= HELPERS =================
 
 def pcm_to_wav(pcm: np.ndarray) -> bytes:
-    """Convert float32 PCM to WAV (16-bit)."""
+    """
+    Convert float32 PCM to WAV bytes.
+    FIX: Explicitly specify format='WAV'
+    """
     buf = io.BytesIO()
-    sf.write(buf, pcm, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    sf.write(
+        buf,
+        pcm,
+        SAMPLE_RATE,
+        format="WAV",        # ✅ REQUIRED
+        subtype="PCM_16",
+    )
     buf.seek(0)
     return buf.read()
 
 
-def translate(text: str, mode: int) -> str:
-    direction = "English to Hindi" if mode == 0 else "Hindi to English"
+def translate(text: str, src: str, tgt: str) -> str:
+    if src == tgt:
+        return text
 
     res = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {
                 "role": "system",
-                "content": (
-                    f"You are a professional interpreter. "
-                    f"Translate strictly {direction}. "
-                    f"No explanations. Preserve meaning."
-                ),
+                "content": f"Translate from {src} to {tgt}. No explanation.",
             },
             {"role": "user", "content": text},
         ],
-        temperature=0.1,
+        temperature=0.0,
     )
 
     return res.choices[0].message.content.strip()
 
 
 def tts(text: str) -> str:
-    """
-    Generate MP3 speech and return base64.
-    IMPORTANT: DO NOT pass `format` (SDK does not support it)
-    """
     audio = client.audio.speech.create(
         model="gpt-4o-mini-tts",
         voice="alloy",
         input=text,
     )
-
-    audio_bytes = audio.read()
-    print("🔊 TTS bytes:", len(audio_bytes))
-
-    return base64.b64encode(audio_bytes).decode("utf-8")
+    return base64.b64encode(audio.read()).decode("utf-8")
 
 
 # ================= ENDPOINT =================
 
 @app.post("/process")
 async def process(req: Request):
-    room = req.headers.get("X-Room", "default")
-    mode = int(req.headers.get("X-Mode", "0"))
+    room = req.headers.get("X-Room")
+    speaker_lang = req.headers.get("X-Speaker-Lang")
 
-    try:
-        # ===== READ AUDIO =====
-        raw = await req.body()
-        pcm = np.frombuffer(raw, dtype=np.float32)
+    raw = await req.body()
+    pcm = np.frombuffer(raw, dtype=np.float32)
 
-        if pcm.size == 0:
-            return {"type": "empty"}
+    if pcm.size == 0:
+        return []
 
-        buffers[room].append(pcm)
-        total_samples = sum(len(x) for x in buffers[room])
+    buffers.setdefault(room, [])
+    buffers[room].append(pcm)
 
-        print(f"🎙️ room={room} buffered={total_samples}")
+    total_samples = sum(len(b) for b in buffers[room])
 
-        # ===== WAIT FOR FULL WINDOW =====
-        if total_samples < WINDOW_SAMPLES:
-            return {"type": "partial"}
+    if total_samples < WINDOW_SAMPLES:
+        return []
 
-        # ===== FINALIZE EXACT WINDOW =====
-        audio = np.concatenate(buffers[room])[:WINDOW_SAMPLES]
-        buffers[room].clear()
+    audio = np.concatenate(buffers[room])[:WINDOW_SAMPLES]
+    buffers[room].clear()
 
-        print(f"📦 Final window ready | samples={len(audio)}")
+    # ===== PCM → WAV =====
+    wav = pcm_to_wav(audio)
 
-        wav = pcm_to_wav(audio)
+    # ===== ASR =====
+    tr = client.audio.transcriptions.create(
+        file=("audio.wav", wav),
+        model="gpt-4o-mini-transcribe",
+        language=speaker_lang,
+        temperature=0.0,
+    )
 
-        # ===== ASR =====
-        print("🧠 Transcribing")
-        tr = client.audio.transcriptions.create(
-            file=("audio.wav", wav),
-            model="gpt-4o-mini-transcribe",
-            language="en" if mode == 0 else "hi",
-            temperature=0.0,
-        )
+    text = tr.text.strip()
+    if not text:
+        return []
 
-        text = tr.text.strip()
-        print("📝 ASR:", text)
+    responses = []
 
-        if not text:
-            return {"type": "empty"}
-
-        # ===== TRANSLATION =====
-        translated = translate(text, mode)
-        print("🌍 TRANSLATED:", translated)
-
-        # ===== TTS =====
+    for target_lang in ("en", "hi"):
+        translated = translate(text, speaker_lang, target_lang)
         audio_b64 = tts(translated)
 
-        # ===== RETURN =====
-        return {
+        responses.append({
             "type": "final",
             "text": text,
             "translated": translated,
             "audio": audio_b64,
-        }
+            "targetLang": target_lang,
+        })
 
-    except Exception as e:
-        print("❌ ERROR:", e)
-        buffers[room].clear()
-        return {"type": "empty"}
+    return responses
