@@ -36,15 +36,25 @@ type MLResponse struct {
 	TargetLang string `json:"targetLang"`
 }
 
+/* ================= AUDIO BUFFER ================= */
+
+type AudioState struct {
+	buffer []byte
+}
+
 /* ================= GLOBALS ================= */
 
 var (
 	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		ReadBufferSize:  8192,
+		WriteBufferSize: 8192,
+		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
 
-	rooms = make(map[string]map[*Client]bool)
-	mu    sync.RWMutex
+	rooms        = make(map[string]map[*Client]bool)
+	audioBuffers = make(map[*Client]*AudioState)
+
+	mu sync.RWMutex
 
 	httpClient = &http.Client{Timeout: 90 * time.Second}
 )
@@ -52,13 +62,20 @@ var (
 /* ================= WS HANDLER ================= */
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
-	conn, _ := upgrader.Upgrade(w, r, nil)
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
 
 	client := &Client{
 		conn: conn,
 		send: make(chan []byte, 32),
 		id:   conn.RemoteAddr().String(),
 	}
+
+	mu.Lock()
+	audioBuffers[client] = &AudioState{}
+	mu.Unlock()
 
 	go writePump(client)
 	readPump(client)
@@ -87,8 +104,30 @@ func readPump(c *Client) {
 
 		// AUDIO PCM
 		if msgType == websocket.BinaryMessage {
-			forwardToML(c, data)
+			handleAudio(c, data)
 		}
+	}
+}
+
+/* ================= AUDIO HANDLING ================= */
+
+func handleAudio(c *Client, data []byte) {
+	mu.Lock()
+	state := audioBuffers[c]
+	state.buffer = append(state.buffer, data...)
+	size := len(state.buffer)
+	mu.Unlock()
+
+	// 0.32s frame = 20480 bytes
+	// 6 seconds ≈ 19 frames
+	if size >= 20480*19 {
+		mu.Lock()
+		audio := make([]byte, size)
+		copy(audio, state.buffer)
+		state.buffer = nil
+		mu.Unlock()
+
+		go forwardToML(c, audio)
 	}
 }
 
@@ -96,7 +135,9 @@ func readPump(c *Client) {
 
 func writePump(c *Client) {
 	for msg := range c.send {
-		c.conn.WriteMessage(websocket.TextMessage, msg)
+		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			return
+		}
 	}
 }
 
@@ -106,9 +147,15 @@ func joinRoom(c *Client, room, lang string) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// remove from old room
+	if c.room != "" && rooms[c.room] != nil {
+		delete(rooms[c.room], c)
+	}
+
 	if rooms[room] == nil {
 		rooms[room] = make(map[*Client]bool)
 	}
+
 	c.room = room
 	c.lang = lang
 	rooms[room][c] = true
@@ -122,11 +169,17 @@ func cleanup(c *Client) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if c.room != "" {
+	delete(audioBuffers, c)
+
+	if c.room != "" && rooms[c.room] != nil {
 		delete(rooms[c.room], c)
+		if len(rooms[c.room]) == 0 {
+			delete(rooms, c.room)
+		}
 	}
+
 	close(c.send)
-	c.conn.Close()
+	_ = c.conn.Close()
 }
 
 /* ================= ML FORWARD ================= */
@@ -135,12 +188,15 @@ func forwardToML(sender *Client, pcm []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	req, _ := http.NewRequestWithContext(
+	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		"http://127.0.0.1:9000/process",
+		"http://127.0.0.1:9001/process",
 		bytes.NewReader(pcm),
 	)
+	if err != nil {
+		return
+	}
 
 	req.Header.Set("X-Room", sender.room)
 	req.Header.Set("X-Speaker-Lang", sender.lang)
@@ -152,7 +208,10 @@ func forwardToML(sender *Client, pcm []byte) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || !json.Valid(body) {
+		return
+	}
 
 	var results []MLResponse
 	if json.Unmarshal(body, &results) != nil {
@@ -166,7 +225,11 @@ func forwardToML(sender *Client, pcm []byte) {
 		for client := range rooms[sender.room] {
 			if client.lang == res.TargetLang {
 				b, _ := json.Marshal(res)
-				client.send <- b
+				select {
+				case client.send <- b:
+				default:
+					// drop if slow client
+				}
 			}
 		}
 	}
@@ -175,7 +238,7 @@ func forwardToML(sender *Client, pcm []byte) {
 /* ================= MAIN ================= */
 
 func main() {
-	log.Println("Go WS server on :8000")
+	log.Println("🚀 Go WS server on :8000")
 	http.HandleFunc("/ws", wsHandler)
-	http.ListenAndServe(":8000", nil)
+	log.Fatal(http.ListenAndServe("0.0.0.0:8000", nil))
 }

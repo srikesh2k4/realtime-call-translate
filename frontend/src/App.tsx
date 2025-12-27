@@ -109,14 +109,15 @@ export default function App() {
   /* ================= START CALL ================= */
 
   const startCall = async () => {
-    if (inCall) return;
+    if (inCall || !audioUnlocked) return;
 
     setSeconds(0);
     setRecognized("");
     setTranslated("");
     setStatus("listening");
 
-    const ws = new WebSocket("ws://localhost:8000/ws");
+    const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+
     wsRef.current = ws;
 
     ws.onopen = async () => {
@@ -124,8 +125,11 @@ export default function App() {
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-      const ctx = new AudioContext({ sampleRate: 16000 });
-      audioCtxRef.current = ctx;
+      let ctx = audioCtxRef.current;
+      if (!ctx) {
+        ctx = new AudioContext({ sampleRate: 16000 });
+        audioCtxRef.current = ctx;
+      }
       await ctx.resume();
 
       analyserRef.current = ctx.createAnalyser();
@@ -197,7 +201,13 @@ export default function App() {
   const stopCall = () => {
     wsRef.current?.close();
     wsRef.current = null;
+
     audioQueueRef.current = [];
+    isPlayingRef.current = false;
+
+    audioCtxRef.current?.close();
+    audioCtxRef.current = null;
+
     setInCall(false);
     setStatus("idle");
     setSeconds(0);
@@ -237,14 +247,19 @@ export default function App() {
               </div>
 
               <p style={styles.hint}>
-                You will hear translations in <b>{lang === "en" ? "English" : "Hindi"}</b>
+                You will hear translations in{" "}
+                <b>{lang === "en" ? "English" : "Hindi"}</b>
               </p>
 
               <button style={styles.secondary} onClick={unlockAudio}>
                 Enable Audio
               </button>
 
-              <button style={styles.primary} onClick={startCall}>
+              <button
+                style={styles.primary}
+                onClick={startCall}
+                disabled={!audioUnlocked}
+              >
                 Start Call
               </button>
             </>
