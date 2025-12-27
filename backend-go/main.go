@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"io"
 	"log"
@@ -16,16 +17,16 @@ import (
 /* ================= TYPES ================= */
 
 type Client struct {
-	conn *websocket.Conn
-	room string
-	lang string // language client wants to hear
-	send chan []byte
-	id   string
+	conn   *websocket.Conn
+	room   string
+	lang   string
+	send   chan []byte
+	mlBusy bool
 }
 
 type JoinMessage struct {
 	Room string `json:"room"`
-	Lang string `json:"lang"` // "en" or "hi"
+	Lang string `json:"lang"`
 }
 
 type MLResponse struct {
@@ -36,10 +37,10 @@ type MLResponse struct {
 	TargetLang string `json:"targetLang"`
 }
 
-/* ================= AUDIO BUFFER ================= */
+/* ================= AUDIO ================= */
 
 type AudioState struct {
-	buffer []byte
+	samples []float32
 }
 
 /* ================= GLOBALS ================= */
@@ -51,12 +52,13 @@ var (
 		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
 
-	rooms        = make(map[string]map[*Client]bool)
-	audioBuffers = make(map[*Client]*AudioState)
+	rooms        = map[string]map[*Client]bool{}
+	audioBuffers = map[*Client]*AudioState{}
+	mu           sync.RWMutex
 
-	mu sync.RWMutex
+	httpClient = &http.Client{Timeout: 120 * time.Second}
 
-	httpClient = &http.Client{Timeout: 90 * time.Second}
+	WINDOW_SAMPLES = 16000 * 6
 )
 
 /* ================= WS HANDLER ================= */
@@ -70,7 +72,6 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	client := &Client{
 		conn: conn,
 		send: make(chan []byte, 32),
-		id:   conn.RemoteAddr().String(),
 	}
 
 	mu.Lock()
@@ -92,17 +93,16 @@ func readPump(c *Client) {
 			return
 		}
 
-		// JOIN MESSAGE
+		// Join message
 		if msgType == websocket.TextMessage {
-			var msg JoinMessage
-			if json.Unmarshal(data, &msg) != nil {
-				continue
+			var join JoinMessage
+			if json.Unmarshal(data, &join) == nil {
+				joinRoom(c, join.Room, join.Lang)
 			}
-			joinRoom(c, msg.Room, msg.Lang)
 			continue
 		}
 
-		// AUDIO PCM
+		// Audio
 		if msgType == websocket.BinaryMessage {
 			handleAudio(c, data)
 		}
@@ -112,23 +112,31 @@ func readPump(c *Client) {
 /* ================= AUDIO HANDLING ================= */
 
 func handleAudio(c *Client, data []byte) {
+	if len(data)%4 != 0 {
+		return
+	}
+
+	samples := make([]float32, len(data)/4)
+	if err := binary.Read(bytes.NewReader(data), binary.LittleEndian, &samples); err != nil {
+		return
+	}
+
 	mu.Lock()
 	state := audioBuffers[c]
-	state.buffer = append(state.buffer, data...)
-	size := len(state.buffer)
-	mu.Unlock()
+	state.samples = append(state.samples, samples...)
 
-	// 0.32s frame = 20480 bytes
-	// 6 seconds ≈ 19 frames
-	if size >= 20480*19 {
-		mu.Lock()
-		audio := make([]byte, size)
-		copy(audio, state.buffer)
-		state.buffer = nil
+	if len(state.samples) >= WINDOW_SAMPLES && !c.mlBusy {
+		audio := make([]float32, WINDOW_SAMPLES)
+		copy(audio, state.samples[:WINDOW_SAMPLES])
+		state.samples = state.samples[WINDOW_SAMPLES:]
+		c.mlBusy = true
 		mu.Unlock()
 
-		go forwardToML(c, audio)
+		go forward(c, audio)
+		return
 	}
+
+	mu.Unlock()
 }
 
 /* ================= WRITE LOOP ================= */
@@ -141,26 +149,21 @@ func writePump(c *Client) {
 	}
 }
 
-/* ================= ROOM JOIN ================= */
+/* ================= ROOM ================= */
 
 func joinRoom(c *Client, room, lang string) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// remove from old room
-	if c.room != "" && rooms[c.room] != nil {
-		delete(rooms[c.room], c)
-	}
-
 	if rooms[room] == nil {
-		rooms[room] = make(map[*Client]bool)
+		rooms[room] = map[*Client]bool{}
 	}
 
 	c.room = room
 	c.lang = lang
 	rooms[room][c] = true
 
-	log.Println("Joined:", c.id, "room:", room, "lang:", lang)
+	log.Println("Joined room:", room, "lang:", lang)
 }
 
 /* ================= CLEANUP ================= */
@@ -170,33 +173,49 @@ func cleanup(c *Client) {
 	defer mu.Unlock()
 
 	delete(audioBuffers, c)
-
-	if c.room != "" && rooms[c.room] != nil {
+	if c.room != "" {
 		delete(rooms[c.room], c)
-		if len(rooms[c.room]) == 0 {
-			delete(rooms, c.room)
-		}
 	}
 
 	close(c.send)
 	_ = c.conn.Close()
 }
 
-/* ================= ML FORWARD ================= */
+/* ================= FORWARD LOGIC ================= */
 
-func forwardToML(sender *Client, pcm []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+func forward(sender *Client, pcm []float32) {
+	defer func() {
+		mu.Lock()
+		sender.mlBusy = false
+		mu.Unlock()
+	}()
+
+	/* ---------- SAME LANGUAGE → RAW AUDIO ---------- */
+
+	mu.RLock()
+	for peer := range rooms[sender.room] {
+		if peer != sender && peer.lang == sender.lang {
+			buf := new(bytes.Buffer)
+			_ = binary.Write(buf, binary.LittleEndian, pcm)
+			peer.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+		}
+	}
+	mu.RUnlock()
+
+	/* ---------- DIFFERENT LANGUAGE → ML ---------- */
+
+	buf := new(bytes.Buffer)
+	_ = binary.Write(buf, binary.LittleEndian, pcm)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(
+	req, _ := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
 		"http://127.0.0.1:9001/process",
-		bytes.NewReader(pcm),
+		buf,
 	)
-	if err != nil {
-		return
-	}
 
 	req.Header.Set("X-Room", sender.room)
 	req.Header.Set("X-Speaker-Lang", sender.lang)
@@ -218,17 +237,18 @@ func forwardToML(sender *Client, pcm []byte) {
 		return
 	}
 
+	/* ---------- SEND TRANSLATED JSON ---------- */
+
 	mu.RLock()
 	defer mu.RUnlock()
 
 	for _, res := range results {
-		for client := range rooms[sender.room] {
-			if client.lang == res.TargetLang {
+		for peer := range rooms[sender.room] {
+			if peer.lang == res.TargetLang {
 				b, _ := json.Marshal(res)
 				select {
-				case client.send <- b:
+				case peer.send <- b:
 				default:
-					// drop if slow client
 				}
 			}
 		}
@@ -238,7 +258,7 @@ func forwardToML(sender *Client, pcm []byte) {
 /* ================= MAIN ================= */
 
 func main() {
-	log.Println("🚀 Go WS server on :8000")
+	log.Println("🚀 Go WebSocket server running on :8000")
 	http.HandleFunc("/ws", wsHandler)
 	log.Fatal(http.ListenAndServe("0.0.0.0:8000", nil))
 }
