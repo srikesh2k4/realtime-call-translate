@@ -1,12 +1,18 @@
-fastapi
-uvicorn
-numpy
-soundfile
-webrtcvad
-torch
-faster-whisper
-transformers==4.41.2
-sentencepiece
-protobuf
-python-dotenv
-openai
+# ---------------- Core API ----------------
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+python-dotenv==1.0.1
+
+# ---------------- Audio Processing ----------------
+numpy==1.26.4
+soundfile==0.12.1
+torch>=2.1.0
+silero-vad==5.1.2
+
+# ---------------- NLP / ML ----------------
+transformers==4.39.3
+accelerate==0.29.3
+sentencepiece==0.2.0
+
+# ---------------- OpenAI ----------------
+openai==1.14.3
