@@ -1,17 +1,16 @@
 ############################
-# Global / OS / Editor
+# OS / Editor
 ############################
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
 *.swp
 *.swo
 *.log
-.idea/
-.vscode/
-*.code-workspace
 
 ############################
-# Environment variables / secrets
+# Secrets / Env
 ############################
 .env
 .env.*
@@ -21,69 +20,65 @@ Thumbs.db
 ############################
 # Node.js (frontend, sfu)
 ############################
-/frontend/node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
+node_modules/
+**/node_modules/**
 
-# Node build output
 dist/
 build/
-.out/
 .vite/
+.out/
+**/dist/**
+**/build/**
+**/.vite/**
+
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
 
 ############################
-# Go (backend-go)
+# Python (ALL projects)
 ############################
-# Go build artifacts
+__pycache__/
+**/__pycache__/**
+
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments (CRITICAL)
+venv/
+.venv/
+env/
+ENV/
+**/venv/**
+**/.venv/**
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+############################
+# Go
+############################
 *.exe
-*.exe~
 *.dll
 *.so
 *.dylib
 *.test
 *.out
-
-# Go workspace
-/backend-go/go.work
-/backend-go/go.work.sum
-
-############################
-# Python (ml-python)
-############################
-ml-python/__pycache__
-ml-python/*.py[cod]
-ml-python/*.pyo
-ml-python/*.pyd
-
-# Virtual environments
-ml-python/venv
-ml-python/.venv/
-ml-python/env/
-ml-python/ENV/
-
-# Python build artifacts
-ml-python/build/
-ml-python/dist/
-ml-python/*.egg-info/
-ml-python/.eggs/
+go.work
+go.work.sum
 
 ############################
 # Docker
 ############################
-# Local docker overrides or state
 docker-compose.override.yml
 
 ############################
-# Certificates / local security artifacts
-############################
-cert.pem
-key.pem
-
-############################
-# Misc generated files
+# Misc
 ############################
 coverage/
-.tmp/
 .cache/
+.tmp/
