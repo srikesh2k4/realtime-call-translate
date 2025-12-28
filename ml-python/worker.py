@@ -3,6 +3,7 @@ import io
 import os
 import time
 import asyncio
+import threading
 import numpy as np
 import soundfile as sf
 import torch
@@ -15,13 +16,13 @@ from silero_vad import load_silero_vad, get_speech_timestamps
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 
 # ======================================================
-# ENV SETUP
+# ENV
 # ======================================================
 
 load_dotenv()
 assert os.getenv("OPENAI_API_KEY"), "OPENAI_API_KEY missing"
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI()  # IMPORTANT: do NOT pass args
 app = FastAPI()
 
 # ======================================================
@@ -36,29 +37,23 @@ WINDOW_SAMPLES = int(SAMPLE_RATE * WINDOW_SECONDS)
 # LOAD MODELS (ONCE)
 # ======================================================
 
-# --- Silero VAD ---
 vad_model = load_silero_vad()
 
-# --- MADLAD 400 ---
-MADLAD_ID = "google/madlad400-3b-mt"
+MODEL_ID = "google/madlad400-3b-mt"
 
-tokenizer = T5Tokenizer.from_pretrained(MADLAD_ID)
+tokenizer = T5Tokenizer.from_pretrained(MODEL_ID)
 model = T5ForConditionalGeneration.from_pretrained(
-    MADLAD_ID,
+    MODEL_ID,
     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     device_map="auto",
 )
 model.eval()
 
-# ======================================================
-# ROOM BUFFERS
-# ======================================================
-
-buffers: dict[str, dict] = {}
-buffers_lock = asyncio.Lock()
+# 🔒 GPU SAFETY LOCK (CRITICAL)
+model_lock = threading.Lock()
 
 # ======================================================
-# AUDIO HELPERS
+# HELPERS
 # ======================================================
 
 def pcm_to_wav(pcm: np.ndarray) -> bytes:
@@ -73,7 +68,8 @@ def rms_energy(pcm: np.ndarray) -> float:
 
 
 def has_speech(pcm: np.ndarray) -> bool:
-    audio = torch.from_numpy(pcm)
+    # IMPORTANT: copy() prevents segfault
+    audio = torch.from_numpy(pcm.copy())
 
     timestamps = get_speech_timestamps(
         audio,
@@ -88,16 +84,12 @@ def has_speech(pcm: np.ndarray) -> bool:
         return False
 
     voiced = sum(t["end"] - t["start"] for t in timestamps)
-    return voiced / len(pcm) > 0.20
+    return voiced / len(pcm) > 0.25
 
-
-# ======================================================
-# TEXT SANITY
-# ======================================================
 
 def valid_text(text: str) -> bool:
     text = text.strip()
-    if len(text) < 5:
+    if len(text) < 4:
         return False
     if not any(c.isalpha() for c in text):
         return False
@@ -108,7 +100,7 @@ def valid_text(text: str) -> bool:
 
 
 # ======================================================
-# MADLAD TRANSLATION
+# MADLAD TRANSLATION (LOW LATENCY)
 # ======================================================
 
 def translate(text: str, target_lang: str) -> str:
@@ -118,16 +110,18 @@ def translate(text: str, target_lang: str) -> str:
         prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=512,
+        max_length=256,
     ).to(model.device)
 
-    with torch.no_grad():
-        out = model.generate(
-            **inputs,
-            max_length=512,
-            do_sample=False,
-            num_beams=1,
-        )
+    with model_lock:
+        with torch.no_grad():
+            out = model.generate(
+                **inputs,
+                max_length=256,
+                do_sample=False,
+                num_beams=1,          # ⚡ fastest & stable
+                early_stopping=True,
+            )
 
     return tokenizer.decode(out[0], skip_special_tokens=True).strip()
 
@@ -146,37 +140,21 @@ def tts(text: str) -> str:
 
 
 # ======================================================
-# CLEANUP TASK
-# ======================================================
-
-@app.on_event("startup")
-async def cleanup():
-    async def loop():
-        while True:
-            await asyncio.sleep(10)
-            now = time.time()
-            async with buffers_lock:
-                for room in list(buffers.keys()):
-                    if now - buffers[room]["last"] > 30:
-                        del buffers[room]
-    asyncio.create_task(loop())
-
-
-# ======================================================
 # CORE PIPELINE
 # ======================================================
 
-def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
-    # 1. Noise gate
+def process_audio(pcm: np.ndarray, speaker_lang: str):
+    # 1️⃣ Noise gate
     if rms_energy(pcm) < 0.004:
         return []
 
-    # 2. Speech gate
+    # 2️⃣ Speech gate
     if not has_speech(pcm):
         return []
 
-    # 3. ASR
+    # 3️⃣ ASR
     wav = pcm_to_wav(pcm)
+
     tr = client.audio.transcriptions.create(
         file=("audio.wav", wav),
         model="gpt-4o-mini-transcribe",
@@ -190,11 +168,14 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
 
     responses = []
 
+    # 4️⃣ Translation (TWO WAY)
     for target_lang in ("en", "hi"):
         if target_lang == speaker_lang:
             continue
 
         translated = translate(text, target_lang)
+
+        # 🔒 hallucination guard
         if not translated or translated.lower() == text.lower():
             continue
 
@@ -211,15 +192,13 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
 
 
 # ======================================================
-# API ENDPOINT
+# API
 # ======================================================
 
 @app.post("/process")
 async def process(req: Request):
-    room = req.headers.get("X-Room")
     speaker_lang = req.headers.get("X-Speaker-Lang")
-
-    if not room or not speaker_lang:
+    if not speaker_lang:
         return []
 
     raw = await req.body()
@@ -227,26 +206,11 @@ async def process(req: Request):
         return []
 
     pcm = np.frombuffer(raw, dtype=np.float32)
-    if pcm.size == 0:
+    if pcm.size < WINDOW_SAMPLES:
         return []
-
-    async with buffers_lock:
-        if room not in buffers:
-            buffers[room] = {"chunks": [], "last": time.time()}
-
-        buffers[room]["chunks"].append(pcm)
-        buffers[room]["last"] = time.time()
-
-        total = sum(len(c) for c in buffers[room]["chunks"])
-        if total < WINDOW_SAMPLES:
-            return []
-
-        audio = np.concatenate(buffers[room]["chunks"])[:WINDOW_SAMPLES]
-        buffers[room]["chunks"].clear()
 
     return await run_in_threadpool(
         process_audio,
-        room,
+        pcm,
         speaker_lang,
-        audio,
     )

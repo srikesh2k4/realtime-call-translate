@@ -1,18 +1,179 @@
-# ---------------- Core API ----------------
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
-python-dotenv==1.0.1
+# Web framework
+fastapi==0.111.0
+uvicorn==0.30.1
 
-# ---------------- Audio Processing ----------------
-numpy==1.26.4
-soundfile==0.12.1
-torch>=2.1.0
-silero-vad==5.1.2
+# OpenAI client (compatible with httpx below)
+openai==1.30.5
+httpx==0.24.1
 
-# ---------------- NLP / ML ----------------
-transformers==4.39.3
-accelerate==0.29.3
-sentencepiece==0.2.0
+# ML / NLP
+torch>=2.0,<2.3
+transformers>=4.38,<4.45
+huggingface_hub>=0.20,<0.24
 
-# ---------------- OpenAI ----------------
-openai==1.14.3
+# Utilities
+python-dotenv>=1.0
+
+
+
+Below is a **complete, chronological, copy-paste-ready command history** covering **everything used to deploy your ML FastAPI worker** on **Ubuntu 24.04 with Python 3.10**.
+
+This is suitable for **documentation, re-deployment, or automation**.
+
+---
+
+# 🔹 Phase 1 — System preparation
+
+```bash
+cat /etc/os-release
+```
+
+```bash
+apt update
+apt install -y software-properties-common curl
+```
+
+---
+
+# 🔹 Phase 2 — Install Python 3.10 (Ubuntu 24.04)
+
+```bash
+add-apt-repository ppa:deadsnakes/ppa
+apt update
+```
+
+```bash
+apt install -y python3.10 python3.10-venv python3.10-dev
+```
+
+```bash
+python3.10 --version
+```
+
+---
+
+# 🔹 Phase 3 — Virtual environment setup
+
+```bash
+deactivate 2>/dev/null
+rm -rf venv
+```
+
+```bash
+python3.10 -m venv venv
+source venv/bin/activate
+```
+
+```bash
+python --version
+```
+
+---
+
+# 🔹 Phase 4 — Python tooling upgrade
+
+```bash
+pip install --upgrade pip setuptools wheel
+```
+
+---
+
+# 🔹 Phase 5 — Fix OpenAI / httpx incompatibility
+
+```bash
+pip uninstall -y openai httpx
+```
+
+```bash
+pip install openai==1.30.5 httpx==0.24.1
+```
+
+---
+
+# 🔹 Phase 6 — Install application dependencies
+
+```bash
+pip install fastapi uvicorn torch transformers huggingface_hub
+```
+
+*(or)*
+
+```bash
+pip install -r requirements.txt
+```
+
+---
+
+# 🔹 Phase 7 — Run server (foreground test)
+
+```bash
+uvicorn worker:app \
+  --host 0.0.0.0 \
+  --port 9001 \
+  --workers 1 \
+  --lifespan off
+```
+
+---
+
+# 🔹 Phase 8 — Background deployment
+
+```bash
+nohup uvicorn worker:app \
+  --host 0.0.0.0 \
+  --port 9001 \
+  --workers 1 \
+  --lifespan off \
+  > ml.log 2>&1 &
+```
+
+---
+
+# 🔹 Phase 9 — Health verification
+
+```bash
+curl http://localhost:9001/docs
+```
+
+---
+
+# 🔹 Phase 10 — Optional warning suppression
+
+```bash
+export PYTHONWARNINGS="ignore::FutureWarning"
+```
+
+---
+
+# 🔹 Phase 11 — (Optional) Dependency locking
+
+```bash
+pip freeze > requirements.lock
+```
+
+---
+
+## ✅ Final Result
+
+* Python **3.10**
+* FastAPI worker running on **port 9001**
+* Stable ML stack
+* No asyncio cancellation errors
+* Background-safe deployment
+
+---
+
+## 📌 Recommended to save this as
+
+```
+deploy-ml-worker.sh
+```
+
+If you want, I can:
+
+* Convert this into a **single executable shell script**
+* Provide a **Dockerfile**
+* Add **systemd service**
+* Add **rollback / cleanup commands**
+
+Tell me what you want next.

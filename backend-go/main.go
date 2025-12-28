@@ -17,17 +17,17 @@ import (
 
 /* ================= TYPES ================= */
 
-type WSMessage struct {
-	MsgType int
-	Data    []byte
-}
-
 type Client struct {
 	conn   *websocket.Conn
 	room   string
 	lang   string
-	send   chan WSMessage
+	send   chan Outgoing
 	mlBusy int32
+}
+
+type Outgoing struct {
+	MsgType int
+	Data    []byte
 }
 
 type JoinMessage struct {
@@ -79,11 +79,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn.SetReadLimit(2 << 20) // 2MB safety
-
 	client := &Client{
 		conn: conn,
-		send: make(chan WSMessage, 64),
+		send: make(chan Outgoing, 64),
 	}
 
 	mu.Lock()
@@ -178,7 +176,7 @@ func joinRoom(c *Client, room, lang string) {
 	log.Println("Joined room:", room, "lang:", lang)
 }
 
-/* ================= CLEANUP ================= */
+/* ================= CLEANUP (PANIC-PROOF) ================= */
 
 func cleanup(c *Client) {
 	mu.Lock()
@@ -190,11 +188,10 @@ func cleanup(c *Client) {
 		delete(rooms[c.room], c)
 	}
 
-	close(c.send)
 	_ = c.conn.Close()
 }
 
-/* ================= FORWARD LOGIC ================= */
+/* ================= CORE FORWARD LOGIC ================= */
 
 func forward(sender *Client, pcm []float32) {
 	defer atomic.StoreInt32(&sender.mlBusy, 0)
@@ -208,7 +205,7 @@ func forward(sender *Client, pcm []float32) {
 			_ = binary.Write(buf, binary.LittleEndian, pcm)
 
 			select {
-			case peer.send <- WSMessage{
+			case peer.send <- Outgoing{
 				MsgType: websocket.BinaryMessage,
 				Data:    buf.Bytes(),
 			}:
@@ -248,8 +245,6 @@ func forward(sender *Client, pcm []float32) {
 		"http://127.0.0.1:9001/process",
 		buf,
 	)
-
-	req.Header.Set("X-Room", sender.room)
 	req.Header.Set("X-Speaker-Lang", sender.lang)
 
 	resp, err := httpClient.Do(req)
@@ -269,7 +264,7 @@ func forward(sender *Client, pcm []float32) {
 		return
 	}
 
-	/* ---------- DISPATCH TRANSLATIONS ---------- */
+	/* ---------- DISPATCH TRANSLATED RESULTS ---------- */
 
 	mu.RLock()
 	defer mu.RUnlock()
@@ -278,9 +273,10 @@ func forward(sender *Client, pcm []float32) {
 		data, _ := json.Marshal(res)
 
 		for peer := range rooms[sender.room] {
-			if peer.lang == res.TargetLang {
+			// ✅ listener only, correct target language
+			if peer != sender && peer.lang == res.TargetLang {
 				select {
-				case peer.send <- WSMessage{
+				case peer.send <- Outgoing{
 					MsgType: websocket.TextMessage,
 					Data:    data,
 				}:
