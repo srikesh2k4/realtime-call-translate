@@ -1,84 +1,94 @@
-############################
-# OS / Editor
-############################
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-*.swp
-*.swo
-*.log
+# Python Virtual Environment (since your venv is directly in the project root)
+bin/
+include/
+lib/
+pyvenv.cfg
+share/
 
-############################
-# Secrets / Env
-############################
-.env
-.env.*
-*.pem
-*.key
-
-############################
-# Node.js (frontend, sfu)
-############################
-node_modules/
-**/node_modules/**
-
-dist/
-build/
-.vite/
-.out/
-**/dist/**
-**/build/**
-**/.vite/**
-
-npm-debug.log*
-yarn-debug.log*
-pnpm-debug.log*
-
-############################
-# Python (ALL projects)
-############################
+# Byte-compiled / optimized / DLL files
 __pycache__/
-**/__pycache__/**
-
 *.py[cod]
+*$py.class
+*.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
 
-# Virtual environments (CRITICAL)
-venv/
-.venv/
-env/
-ENV/
-**/venv/**
-**/.venv/**
-
-# Python packaging
-build/
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+.nyc_output
+coverage/
+*.lcov
+.cache
+.parcel-cache
+.rpt2_cache/
+.grunt
+bower_components/
 dist/
-*.egg-info/
-.eggs/
+build/
 
-############################
-# Go
-############################
-*.exe
-*.dll
-*.so
-*.dylib
-*.test
-*.out
-go.work
-go.work.sum
+# Logs and databases
+*.log
+*.sql
+*.sqlite
+*.sqlite3
 
-############################
-# Docker
-############################
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor/IDE files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# Environment variables / secrets
+.env
+*.env
+.env.local
+.env.development
+.env.production
+
+# Large model files / assets (optional – remove if you want to commit them)
+# whisperx assets are quite large (~500MB+ for some models)
+assets/
+*.bin
+*.npz
+*.pt
+*.pth
+
+# Docker / container builds
+Dockerfile.*  # ignore temp Dockerfiles if any
+.dockerignore
 docker-compose.override.yml
 
-############################
-# Misc
-############################
-coverage/
-.cache/
-.tmp/
+# Miscellaneous
+*.tmp
+*.temp
+temp/
+tmp/
+*.bak
+*.orig
+*.rej
