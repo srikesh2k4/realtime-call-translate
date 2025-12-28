@@ -1,94 +1,20 @@
-# Python Virtual Environment (since your venv is directly in the project root)
+# Virtual environment
 bin/
 include/
 lib/
 pyvenv.cfg
 share/
 
-# Byte-compiled / optimized / DLL files
+# Python cache
 __pycache__/
-*.py[cod]
-*$py.class
 *.pyc
 *.pyo
 *.pyd
-.pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.nox/
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
 
 # Node.js
 node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-lerna-debug.log*
-.pnpm-debug.log*
-.nyc_output
-coverage/
-*.lcov
-.cache
-.parcel-cache
-.rpt2_cache/
-.grunt
-bower_components/
-dist/
-build/
 
-# Logs and databases
-*.log
-*.sql
-*.sqlite
-*.sqlite3
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
-
-# Editor/IDE files
-.idea/
-.vscode/
-*.sublime-project
-*.sublime-workspace
-*.swp
-*.swo
-
-# Environment variables / secrets
+# Other common ignores
 .env
-*.env
-.env.local
-.env.development
-.env.production
-
-# Large model files / assets (optional – remove if you want to commit them)
-# whisperx assets are quite large (~500MB+ for some models)
-assets/
-*.bin
-*.npz
-*.pt
-*.pth
-
-# Docker / container builds
-Dockerfile.*  # ignore temp Dockerfiles if any
-.dockerignore
-docker-compose.override.yml
-
-# Miscellaneous
-*.tmp
-*.temp
-temp/
-tmp/
-*.bak
-*.orig
-*.rej
+*.log
+.DS_Store
