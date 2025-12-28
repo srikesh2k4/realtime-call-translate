@@ -1,20 +1,84 @@
-# Virtual environment
-bin/
-include/
-lib/
-pyvenv.cfg
-share/
+############################
+# OS / Editor
+############################
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*.log
 
-# Python cache
+############################
+# Secrets / Env
+############################
+.env
+.env.*
+*.pem
+*.key
+
+############################
+# Node.js (frontend, sfu)
+############################
+node_modules/
+**/node_modules/**
+
+dist/
+build/
+.vite/
+.out/
+**/dist/**
+**/build/**
+**/.vite/**
+
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+############################
+# Python (ALL projects)
+############################
 __pycache__/
-*.pyc
+**/__pycache__/**
+
+*.py[cod]
 *.pyo
 *.pyd
 
-# Node.js
-node_modules/
+# Virtual environments (CRITICAL)
+venv/
+.venv/
+env/
+ENV/
+**/venv/**
+**/.venv/**
 
-# Other common ignores
-.env
-*.log
-.DS_Store
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+############################
+# Go
+############################
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+############################
+# Docker
+############################
+docker-compose.override.yml
+
+############################
+# Misc
+############################
+coverage/
+.cache/
+.tmp/
