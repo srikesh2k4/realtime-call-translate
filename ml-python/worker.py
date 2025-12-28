@@ -14,41 +14,52 @@ from openai import OpenAI
 from silero_vad import load_silero_vad, get_speech_timestamps
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 
-# ================= ENV & CLIENT =================
+# ======================================================
+# ENV SETUP
+# ======================================================
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+assert os.getenv("OPENAI_API_KEY"), "OPENAI_API_KEY missing"
 
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 app = FastAPI()
 
-# ================= AUDIO CONFIG =================
+# ======================================================
+# AUDIO CONFIG
+# ======================================================
 
 SAMPLE_RATE = 16000
 WINDOW_SECONDS = 2.5
 WINDOW_SAMPLES = int(SAMPLE_RATE * WINDOW_SECONDS)
 
-# ================= LOAD MODELS (ONCE) =================
+# ======================================================
+# LOAD MODELS (ONCE)
+# ======================================================
 
-# Silero VAD
+# --- Silero VAD ---
 vad_model = load_silero_vad()
 
-# MADLAD-400 for translation
-MADLAD_MODEL_ID = "jbochi/madlad400-3b-mt"
+# --- MADLAD 400 ---
+MADLAD_ID = "google/madlad400-3b-mt"
 
-madlad_tokenizer = T5Tokenizer.from_pretrained(MADLAD_MODEL_ID)
-madlad_model = T5ForConditionalGeneration.from_pretrained(
-    MADLAD_MODEL_ID,
+tokenizer = T5Tokenizer.from_pretrained(MADLAD_ID)
+model = T5ForConditionalGeneration.from_pretrained(
+    MADLAD_ID,
     torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
     device_map="auto",
 )
-madlad_model.eval()
+model.eval()
 
-# ================= ROOM BUFFERS =================
+# ======================================================
+# ROOM BUFFERS
+# ======================================================
 
 buffers: dict[str, dict] = {}
 buffers_lock = asyncio.Lock()
 
-# ================= AUDIO HELPERS =================
+# ======================================================
+# AUDIO HELPERS
+# ======================================================
 
 def pcm_to_wav(pcm: np.ndarray) -> bytes:
     buf = io.BytesIO()
@@ -61,15 +72,15 @@ def rms_energy(pcm: np.ndarray) -> float:
     return float(np.sqrt(np.mean(pcm * pcm)))
 
 
-def has_real_speech(pcm: np.ndarray) -> bool:
+def has_speech(pcm: np.ndarray) -> bool:
     audio = torch.from_numpy(pcm)
 
     timestamps = get_speech_timestamps(
         audio,
         vad_model,
         sampling_rate=SAMPLE_RATE,
-        threshold=0.65,
-        min_speech_duration_ms=500,
+        threshold=0.6,
+        min_speech_duration_ms=400,
         min_silence_duration_ms=300,
     )
 
@@ -77,68 +88,53 @@ def has_real_speech(pcm: np.ndarray) -> bool:
         return False
 
     voiced = sum(t["end"] - t["start"] for t in timestamps)
-    return (voiced / len(pcm)) > 0.20
+    return voiced / len(pcm) > 0.20
 
 
-# ================= TEXT SANITY =================
+# ======================================================
+# TEXT SANITY
+# ======================================================
 
-def is_valid_transcript(text: str) -> bool:
+def valid_text(text: str) -> bool:
     text = text.strip()
-
     if len(text) < 5:
         return False
-
-    fillers = {
-        "uh", "um", "hmm", "ah", "oh", "mm",
-        "you", "thanks", "thank you"
-    }
-    if text.lower() in fillers:
-        return False
-
-    words = text.split()
-
-    if len(words) == 1:
-        return False
-
-    if len(set(words)) <= 2 and len(words) > 4:
-        return False
-
     if not any(c.isalpha() for c in text):
         return False
-
+    words = text.split()
+    if len(words) == 1:
+        return False
     return True
 
 
-# ================= MADLAD TRANSLATION =================
+# ======================================================
+# MADLAD TRANSLATION
+# ======================================================
 
-def madlad_translate(text: str, target_lang: str) -> str:
-    """
-    Deterministic translation using MADLAD-400
-    """
+def translate(text: str, target_lang: str) -> str:
     prompt = f"<2{target_lang}> {text}"
 
-    inputs = madlad_tokenizer(
+    inputs = tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
         max_length=512,
-    ).to(madlad_model.device)
+    ).to(model.device)
 
     with torch.no_grad():
-        outputs = madlad_model.generate(
+        out = model.generate(
             **inputs,
             max_length=512,
             do_sample=False,
             num_beams=1,
         )
 
-    return madlad_tokenizer.decode(
-        outputs[0],
-        skip_special_tokens=True
-    ).strip()
+    return tokenizer.decode(out[0], skip_special_tokens=True).strip()
 
 
-# ================= TTS =================
+# ======================================================
+# TTS
+# ======================================================
 
 def tts(text: str) -> str:
     audio = client.audio.speech.create(
@@ -149,10 +145,12 @@ def tts(text: str) -> str:
     return base64.b64encode(audio.read()).decode("utf-8")
 
 
-# ================= CLEANUP TASK =================
+# ======================================================
+# CLEANUP TASK
+# ======================================================
 
 @app.on_event("startup")
-async def cleanup_task():
+async def cleanup():
     async def loop():
         while True:
             await asyncio.sleep(10)
@@ -164,20 +162,21 @@ async def cleanup_task():
     asyncio.create_task(loop())
 
 
-# ================= CORE PIPELINE =================
+# ======================================================
+# CORE PIPELINE
+# ======================================================
 
 def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
     # 1. Noise gate
-    if rms_energy(pcm) < 0.0045:
+    if rms_energy(pcm) < 0.004:
         return []
 
-    # 2. Speech detection
-    if not has_real_speech(pcm):
+    # 2. Speech gate
+    if not has_speech(pcm):
         return []
 
+    # 3. ASR
     wav = pcm_to_wav(pcm)
-
-    # 3. ASR (OpenAI — best at this)
     tr = client.audio.transcriptions.create(
         file=("audio.wav", wav),
         model="gpt-4o-mini-transcribe",
@@ -186,30 +185,24 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
     )
 
     text = tr.text.strip()
-
-    # 4. Text sanity
-    if not is_valid_transcript(text):
+    if not valid_text(text):
         return []
 
     responses = []
 
-    # 5. Translation (MADLAD — best at this)
     for target_lang in ("en", "hi"):
         if target_lang == speaker_lang:
             continue
 
-        translated = madlad_translate(text, target_lang)
-
+        translated = translate(text, target_lang)
         if not translated or translated.lower() == text.lower():
             continue
-
-        audio_b64 = tts(translated)
 
         responses.append({
             "type": "final",
             "sourceText": text,
             "translatedText": translated,
-            "audio": audio_b64,
+            "audio": tts(translated),
             "sourceLang": speaker_lang,
             "targetLang": target_lang,
         })
@@ -217,7 +210,9 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
     return responses
 
 
-# ================= API =================
+# ======================================================
+# API ENDPOINT
+# ======================================================
 
 @app.post("/process")
 async def process(req: Request):

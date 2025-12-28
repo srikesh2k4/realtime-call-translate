@@ -7,14 +7,14 @@ type Language = "en" | "hi";
 
 type WSMessage = {
   type?: "final";
-  text?: string;
-  translated?: string;
+  sourceText?: string;
+  translatedText?: string;
   audio?: string;
 };
 
 /* ================= CONFIG ================= */
 
-// Use same-origin WS (Vite proxy handles LAN + HTTPS)
+// Same-origin WebSocket (Vite proxy / production-safe)
 const WS_URL =
   `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 
@@ -137,7 +137,7 @@ export default function App() {
       const mic = ctx.createMediaStreamSource(stream);
       mic.connect(analyserRef.current);
 
-      /* ---- mic level animation ---- */
+      /* ---- mic animation ---- */
       const data = new Uint8Array(analyserRef.current.frequencyBinCount);
       const loop = () => {
         analyserRef.current?.getByteFrequencyData(data);
@@ -183,7 +183,7 @@ export default function App() {
     ws.onmessage = async e => {
       const ctx = audioCtxRef.current!;
 
-      // 🔵 SAME LANGUAGE → RAW PCM AUDIO
+      // 🔵 SAME LANGUAGE → RAW PCM
       if (e.data instanceof ArrayBuffer) {
         const pcm = new Float32Array(e.data);
         const buffer = ctx.createBuffer(1, pcm.length, 16000);
@@ -196,13 +196,13 @@ export default function App() {
         return;
       }
 
-      // 🟢 DIFFERENT LANGUAGE → TRANSLATED JSON
+      // 🟢 TRANSLATED JSON
       const msg: WSMessage = JSON.parse(e.data);
       if (msg.type !== "final") return;
 
       setStatus("processing");
-      msg.text && setRecognized(msg.text);
-      msg.translated && setTranslated(msg.translated);
+      msg.sourceText && setRecognized(msg.sourceText);
+      msg.translatedText && setTranslated(msg.translatedText);
       msg.audio && enqueueAudio(msg.audio);
     };
 
