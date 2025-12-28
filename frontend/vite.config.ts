@@ -1,22 +1,37 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import fs from "fs";
 
 export default defineConfig({
   plugins: [react()],
+
   server: {
     host: "0.0.0.0",
     port: 5173,
-    https: {
-      key: fs.readFileSync("./key.pem"),
-      cert: fs.readFileSync("./cert.pem"),
-    },
+
+    // 🔐 REQUIRED for Cloudflare tunnels
+    allowedHosts: [
+      "localhost",
+      "127.0.0.1",
+      ".trycloudflare.com",
+    ],
+
+    // 🔁 WebSocket proxy ONLY for Go backend
     proxy: {
       "/ws": {
-        target: "ws://192.168.1.101:8000",
+        target: "ws://127.0.0.1:8000",
         ws: true,
         changeOrigin: true,
+        secure: false,
       },
     },
+  },
+
+  // Prevent Vite from optimizing WebSocket / ffmpeg deps incorrectly
+  optimizeDeps: {
+    exclude: ["@ffmpeg/ffmpeg"],
+  },
+
+  build: {
+    target: "esnext",
   },
 });
