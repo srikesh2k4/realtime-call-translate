@@ -1,6 +1,6 @@
-########################################
-# OS / EDITOR
-########################################
+############################
+# Global / OS / Editor
+############################
 .DS_Store
 Thumbs.db
 *.swp
@@ -8,106 +8,82 @@ Thumbs.db
 *.log
 .idea/
 .vscode/
-*.iml
+*.code-workspace
 
-########################################
-# ENV / SECRETS (CRITICAL)
-########################################
+############################
+# Environment variables / secrets
+############################
 .env
 .env.*
 *.pem
 *.key
-*.crt
-cert.pem
-key.pem
 
-########################################
-# NODE / FRONTEND (VITE + REACT)
-########################################
-node_modules/
-dist/
-build/
-.vite/
-.cache/
+############################
+# Node.js (frontend, sfu)
+############################
+/frontend/node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-########################################
-# PYTHON / ML
-########################################
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.so
-*.egg-info/
-.eggs/
-.cache/
-.mypy_cache/
-.pytest_cache/
-.ipynb_checkpoints/
-venv/
-.venv/
-env/
-ENV/
-pip-wheel-metadata/
+# Node build output
+dist/
+build/
+.out/
+.vite/
 
-########################################
-# TORCH / TRANSFORMERS
-########################################
-.cache/torch/
-.cache/huggingface/
-.cache/transformers/
-*.pt
-*.bin
-*.safetensors
-
-########################################
-# GO
-########################################
+############################
+# Go (backend-go)
+############################
+# Go build artifacts
 *.exe
+*.exe~
 *.dll
 *.so
 *.dylib
 *.test
 *.out
-/go.sum
-/bin/
-tmp/
 
-########################################
-# DOCKER
-########################################
-*.tar
+# Go workspace
+/backend-go/go.work
+/backend-go/go.work.sum
+
+############################
+# Python (ml-python)
+############################
+ml-python/__pycache__
+ml-python/*.py[cod]
+ml-python/*.pyo
+ml-python/*.pyd
+
+# Virtual environments
+ml-python/venv
+ml-python/.venv/
+ml-python/env/
+ml-python/ENV/
+
+# Python build artifacts
+ml-python/build/
+ml-python/dist/
+ml-python/*.egg-info/
+ml-python/.eggs/
+
+############################
+# Docker
+############################
+# Local docker overrides or state
 docker-compose.override.yml
 
-########################################
-# LOGS / RUNTIME
-########################################
-logs/
-*.log
+############################
+# Certificates / local security artifacts
+############################
+cert.pem
+key.pem
 
-########################################
-# UPLOADS / AUDIO
-########################################
-*.wav
-*.mp3
-*.ogg
-*.flac
-*.pcm
-
-########################################
-# JUPYTER / NOTEBOOKS
-########################################
-.ipynb_checkpoints/
-*.ipynb
-
-########################################
-# VAST.AI / GPU TEMP
-########################################
-workspace/
-checkpoints/
-runs/
-outputs/
+############################
+# Misc generated files
+############################
+coverage/
+.tmp/
+.cache/
