@@ -1,232 +1,259 @@
-import base64
-import io
+# ================= HARD SAFETY (MUST BE FIRST) =================
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# ===============================================================
+
+import io
 import time
+import base64
 import asyncio
 import numpy as np
 import soundfile as sf
 import torch
-
+from threading import Lock
 from fastapi import FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from dotenv import load_dotenv
 from openai import OpenAI
 from silero_vad import load_silero_vad, get_speech_timestamps
 
-# ================= SETUP =================
+# ================= TORCH SAFETY =================
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
+# ================= SETUP =================
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-app = FastAPI()
+app = FastAPI(title="Neuro-Intent Aligned Speech Translation System (NIASTS)")
 
 SAMPLE_RATE = 16000
-WINDOW_SECONDS = 2.5
+WINDOW_SECONDS = 0.6
 WINDOW_SAMPLES = int(SAMPLE_RATE * WINDOW_SECONDS)
+
+DRIFT_THRESHOLD = 0.10
+MIN_EMBEDDINGS = 4
+MIN_SILENCE_SEC = 0.6
 
 vad_model = load_silero_vad()
 
-# room -> {"chunks": list[np.ndarray], "last": timestamp}
-buffers: dict[str, dict] = {}
-buffers_lock = asyncio.Lock()
+rooms = {}
+rooms_lock = asyncio.Lock()
+
+vad_lock = Lock()
+process_lock = Lock()
 
 # ================= AUDIO HELPERS =================
-
 def pcm_to_wav(pcm: np.ndarray) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, pcm, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     buf.seek(0)
     return buf.read()
 
-
-def rms_energy(pcm: np.ndarray) -> float:
+def rms(pcm: np.ndarray) -> float:
     return float(np.sqrt(np.mean(pcm * pcm)))
 
+def detect_speech(pcm: np.ndarray) -> bool:
+    audio = torch.from_numpy(pcm.copy())
+    with vad_lock:
+        ts = get_speech_timestamps(
+            audio,
+            vad_model,
+            sampling_rate=SAMPLE_RATE,
+            threshold=0.65,
+            min_speech_duration_ms=300,
+            min_silence_duration_ms=300
+        )
+    return bool(ts)
 
-def has_real_speech(pcm: np.ndarray) -> bool:
-    audio = torch.from_numpy(pcm)
-
-    timestamps = get_speech_timestamps(
-        audio,
-        vad_model,
-        sampling_rate=SAMPLE_RATE,
-        threshold=0.65,                  # stricter
-        min_speech_duration_ms=500,
-        min_silence_duration_ms=300,
+# ================= SEMANTIC CORE =================
+def embed(text: str) -> np.ndarray:
+    res = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
     )
+    return np.array(res.data[0].embedding, dtype=np.float32)
 
-    if not timestamps:
+def cosine_drift(a: np.ndarray, b: np.ndarray) -> float:
+    return 1.0 - float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+def semantic_stable(embeds: list[np.ndarray]) -> bool:
+    if len(embeds) < MIN_EMBEDDINGS:
         return False
+    drifts = [
+        cosine_drift(embeds[i - 1], embeds[i])
+        for i in range(1, len(embeds))
+    ]
+    return float(np.mean(drifts[-3:])) < DRIFT_THRESHOLD
 
-    # Require at least 20% voiced audio
-    voiced = sum(t["end"] - t["start"] for t in timestamps)
-    return (voiced / len(pcm)) > 0.20
-
-
-# ================= TEXT SANITY =================
-
-def is_valid_transcript(text: str) -> bool:
-    text = text.strip()
-
-    if len(text) < 5:
+# ================= STRICT VALIDATION =================
+def linguistically_complete(text: str) -> bool:
+    if len(text.split()) < 4:
         return False
+    return any(p in text for p in [".", "?", "!", "।"])
 
-    # Reject filler words
-    fillers = {
-        "uh", "um", "hmm", "ah", "oh", "mm",
-        "you", "thanks", "thank you"
-    }
-    if text.lower() in fillers:
-        return False
-
-    words = text.split()
-
-    # Single-word hallucination
-    if len(words) == 1:
-        return False
-
-    # Repetition hallucination
-    if len(set(words)) <= 2 and len(words) > 4:
-        return False
-
-    # Garbage symbols
-    if not any(c.isalpha() for c in text):
-        return False
-
-    return True
-
-
-# ================= NLP =================
-
-def translate(text: str, src: str, tgt: str) -> str:
-    if src == tgt:
-        return text
-
-    res = client.chat.completions.create(
+# ================= STRICT TRANSLATION =================
+def strict_translate(text: str, src: str, tgt: str) -> str:
+    resp = client.responses.create(
         model="gpt-4.1-mini",
-        messages=[
-            {"role": "system", "content": f"Translate {src} to {tgt}. Only output text."},
-            {"role": "user", "content": text},
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a translation engine. "
+                    "Translate EXACTLY. "
+                    "Do NOT add, remove, explain, rephrase, or comment. "
+                    "Output ONLY the translated text."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Translate from {src} to {tgt}:\n{text}"
+            }
         ],
         temperature=0.0,
+        max_output_tokens=300
     )
-    return res.choices[0].message.content.strip()
 
+    out = resp.output_text.strip()
 
+    # HARD OUTPUT GUARDS
+    if not out:
+        raise ValueError("Empty translation")
+
+    if len(out.split()) > len(text.split()) * 1.2:
+        raise ValueError("Hallucination detected")
+
+    forbidden = ["i think", "sorry", "hello", "you said", "as an ai"]
+    if any(f in out.lower() for f in forbidden):
+        raise ValueError("Conversational output detected")
+
+    return out
+
+# ================= TTS =================
 def tts(text: str) -> str:
     audio = client.audio.speech.create(
         model="gpt-4o-mini-tts",
         voice="alloy",
-        input=text,
+        input=text
     )
-    return base64.b64encode(audio.read()).decode("utf-8")
+    return base64.b64encode(audio.read()).decode()
 
+# ================= CORE PIPELINE =================
+def process_segment(room: str, lang: str, pcm: np.ndarray):
+    with process_lock:
 
-# ================= CLEANUP =================
+        if rms(pcm) < 0.004:
+            return []
 
-@app.on_event("startup")
-async def cleanup_task():
-    async def loop():
-        while True:
-            await asyncio.sleep(10)
-            now = time.time()
-            async with buffers_lock:
-                for room in list(buffers.keys()):
-                    if now - buffers[room]["last"] > 30:
-                        del buffers[room]
-    asyncio.create_task(loop())
+        has_voice = detect_speech(pcm)
 
+        state = rooms[room]
 
-# ================= CORE PROCESS =================
+        if has_voice:
+            state["last_voice"] = time.time()
 
-def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
-    # 1. Hard noise gate
-    if rms_energy(pcm) < 0.0045:
-        return []
+        if not has_voice:
+            return []
 
-    # 2. Speech probability gate
-    if not has_real_speech(pcm):
-        return []
+        wav = pcm_to_wav(pcm)
 
-    wav = pcm_to_wav(pcm)
+        tr = client.audio.transcriptions.create(
+            file=("audio.wav", wav),
+            model="gpt-4o-mini-transcribe",
+            language=lang,
+            temperature=0.0
+        )
 
-    # 3. ASR
-    tr = client.audio.transcriptions.create(
-        file=("audio.wav", wav),
-        model="gpt-4o-mini-transcribe",
-        language=speaker_lang,
-        temperature=0.0,
-    )
+        text = tr.text.strip()
+        if len(text) < 4:
+            return []
 
-    text = tr.text.strip()
+        state["texts"].append(text)
+        state["embeddings"].append(embed(text))
+        state["last"] = time.time()
 
-    # 4. Text sanity gate
-    if not is_valid_transcript(text):
-        return []
+        # ===== INTENT COMMIT CONDITIONS =====
+        if not semantic_stable(state["embeddings"]):
+            return []
 
-    responses = []
+        if not linguistically_complete(text):
+            return []
 
-    for target_lang in ("en", "hi"):
-        # 🔒 HARD FIX: skip same language
-        if target_lang == speaker_lang:
-            continue
+        if time.time() - state["last_voice"] < MIN_SILENCE_SEC:
+            return []
 
-        translated = translate(text, speaker_lang, target_lang)
+        # ===== COMMIT =====
+        final_text = " ".join(state["texts"])
 
-        # Safety: translated text must differ
-        if translated.strip().lower() == text.lower():
-            continue
+        outputs = []
+        for tgt in ("en", "hi"):
+            if tgt == lang:
+                continue
+            try:
+                translated = strict_translate(final_text, lang, tgt)
+                audio = tts(translated)
+                outputs.append({
+                    "type": "final",
+                    "sourceText": final_text,
+                    "translatedText": translated,
+                    "audio": audio,
+                    "sourceLang": lang,
+                    "targetLang": tgt
+                })
+            except Exception:
+                pass  # FAIL SAFE: SILENCE
 
-        audio_b64 = tts(translated)
+        # RESET SESSION (semantic isolation)
+        state["texts"].clear()
+        state["embeddings"].clear()
 
-        responses.append({
-            "type": "final",
-            "sourceText": text,
-            "translatedText": translated,
-            "audio": audio_b64,
-            "sourceLang": speaker_lang,
-            "targetLang": target_lang,
-        })
-
-    return responses
-
+        return outputs
 
 # ================= API =================
-
 @app.post("/process")
 async def process(req: Request):
-    room = req.headers.get("X-Room")
-    speaker_lang = req.headers.get("X-Speaker-Lang")
+    room = req.headers.get("X-Session-Id")
+    lang = req.headers.get("X-Speaker-Lang")
 
-    if not room or not speaker_lang:
+    if not room or not lang:
         return []
 
     raw = await req.body()
-
-    if len(raw) % 4 != 0:
-        return []
-
     pcm = np.frombuffer(raw, dtype=np.float32)
     if pcm.size == 0:
         return []
 
-    async with buffers_lock:
-        if room not in buffers:
-            buffers[room] = {"chunks": [], "last": time.time()}
+    pcm = pcm[:WINDOW_SAMPLES]
 
-        buffers[room]["chunks"].append(pcm)
-        buffers[room]["last"] = time.time()
-
-        total = sum(len(c) for c in buffers[room]["chunks"])
-        if total < WINDOW_SAMPLES:
-            return []
-
-        audio = np.concatenate(buffers[room]["chunks"])[:WINDOW_SAMPLES]
-        buffers[room]["chunks"].clear()
+    async with rooms_lock:
+        if room not in rooms:
+            rooms[room] = {
+                "texts": [],
+                "embeddings": [],
+                "last": time.time(),
+                "last_voice": 0.0
+            }
 
     return await run_in_threadpool(
-        process_audio,
+        process_segment,
         room,
-        speaker_lang,
-        audio,
+        lang,
+        pcm
     )
+
+# ================= CLEANUP =================
+@app.on_event("startup")
+async def cleanup():
+    async def loop():
+        while True:
+            await asyncio.sleep(20)
+            now = time.time()
+            async with rooms_lock:
+                for r in list(rooms):
+                    if now - rooms[r]["last"] > 40:
+                        del rooms[r]
+    asyncio.create_task(loop())
