@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 
 /* ================= TYPES ================= */
@@ -7,9 +7,13 @@ type Language = "en" | "hi";
 
 type WSMessage = {
   type?: "final";
-  text?: string;
-  translated?: string;
+  sourceText?: string;
+  translatedText?: string;
   audio?: string;
+  sourceLang?: string;
+  targetLang?: string;
+  confidence?: number;
+  processingTime?: number;
 };
 
 /* ================= CONFIG ================= */
@@ -17,6 +21,10 @@ type WSMessage = {
 // Use same-origin WS (Vite proxy handles LAN + HTTPS)
 const WS_URL =
   `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+
+// Audio configuration
+const SAMPLE_RATE = 16000;
+const CHUNK_SIZE = 4096; // Smaller chunks for lower latency
 
 /* ================= APP ================= */
 
@@ -27,6 +35,8 @@ export default function App() {
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const workletRef = useRef<AudioWorkletNode | null>(null);
 
   const audioQueueRef = useRef<string[]>([]);
   const isPlayingRef = useRef(false);
@@ -42,10 +52,21 @@ export default function App() {
 
   const [recognized, setRecognized] = useState("");
   const [translated, setTranslated] = useState("");
+  const [processingTime, setProcessingTime] = useState(0);
+  const [confidence, setConfidence] = useState(0);
 
   const [status, setStatus] = useState<
     "idle" | "listening" | "processing" | "speaking"
   >("idle");
+
+  /* ================= CONVERSATION HISTORY ================= */
+  
+  const [history, setHistory] = useState<Array<{
+    source: string;
+    translated: string;
+    time: string;
+    lang: string;
+  }>>([]);
 
   /* ================= TIMER ================= */
 
@@ -64,17 +85,17 @@ export default function App() {
 
   /* ================= AUDIO CONTEXT ================= */
 
-  const ensureAudioContext = async () => {
+  const ensureAudioContext = useCallback(async () => {
     if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
-      audioCtxRef.current = new AudioContext({ sampleRate: 16000 });
+      audioCtxRef.current = new AudioContext({ sampleRate: SAMPLE_RATE });
     }
     await audioCtxRef.current.resume();
     setAudioUnlocked(true);
-  };
+  }, []);
 
   /* ================= TTS PLAYBACK ================= */
 
-  const playNext = async () => {
+  const playNext = useCallback(async () => {
     if (!audioUnlocked || isPlayingRef.current) return;
 
     const base64 = audioQueueRef.current.shift();
@@ -86,7 +107,7 @@ export default function App() {
     try {
       const ctx = audioCtxRef.current!;
       const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-      const buffer = await ctx.decodeAudioData(bytes.buffer);
+      const buffer = await ctx.decodeAudioData(bytes.buffer.slice(0));
 
       const src = ctx.createBufferSource();
       src.buffer = buffer;
@@ -94,20 +115,22 @@ export default function App() {
 
       src.onended = () => {
         isPlayingRef.current = false;
-        setStatus("idle");
+        setStatus("listening");
         playNext();
       };
 
       src.start();
-    } catch {
+    } catch (e) {
+      console.error("Audio playback error:", e);
       isPlayingRef.current = false;
+      setStatus("listening");
     }
-  };
+  }, [audioUnlocked]);
 
-  const enqueueAudio = (b64: string) => {
+  const enqueueAudio = useCallback((b64: string) => {
     audioQueueRef.current.push(b64);
     playNext();
-  };
+  }, [playNext]);
 
   /* ================= START CALL ================= */
 
@@ -117,6 +140,7 @@ export default function App() {
     setSeconds(0);
     setRecognized("");
     setTranslated("");
+    setHistory([]);
     setStatus("listening");
 
     await ensureAudioContext();
@@ -128,7 +152,16 @@ export default function App() {
     ws.onopen = async () => {
       ws.send(JSON.stringify({ room, lang }));
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: SAMPLE_RATE,
+        } 
+      });
+      mediaStreamRef.current = stream;
+      
       const ctx = audioCtxRef.current!;
 
       analyserRef.current = ctx.createAnalyser();
@@ -146,13 +179,13 @@ export default function App() {
       };
       loop();
 
-      /* ---- audio worklet ---- */
+      /* ---- audio worklet with noise suppression ---- */
       await ctx.audioWorklet.addModule("/audio-worklet.js");
       const worklet = new AudioWorkletNode(ctx, "pcm-processor");
+      workletRef.current = worklet;
 
       let buffers: Float32Array[] = [];
       let size = 0;
-      const TARGET = 5120;
 
       worklet.port.onmessage = e => {
         if (!(e.data instanceof Float32Array)) return;
@@ -161,7 +194,8 @@ export default function App() {
         buffers.push(e.data);
         size += e.data.length;
 
-        if (size >= TARGET) {
+        // Send smaller chunks more frequently for lower latency
+        if (size >= CHUNK_SIZE) {
           const merged = new Float32Array(size);
           let offset = 0;
           for (const b of buffers) {
@@ -186,7 +220,7 @@ export default function App() {
       // 🔵 SAME LANGUAGE → RAW PCM AUDIO
       if (e.data instanceof ArrayBuffer) {
         const pcm = new Float32Array(e.data);
-        const buffer = ctx.createBuffer(1, pcm.length, 16000);
+        const buffer = ctx.createBuffer(1, pcm.length, SAMPLE_RATE);
         buffer.copyToChannel(pcm, 0);
 
         const src = ctx.createBufferSource();
@@ -201,9 +235,30 @@ export default function App() {
       if (msg.type !== "final") return;
 
       setStatus("processing");
-      msg.text && setRecognized(msg.text);
-      msg.translated && setTranslated(msg.translated);
-      msg.audio && enqueueAudio(msg.audio);
+      
+      if (msg.sourceText) {
+        setRecognized(msg.sourceText);
+      }
+      if (msg.translatedText) {
+        setTranslated(msg.translatedText);
+        
+        // Add to history
+        setHistory(prev => [...prev.slice(-9), {
+          source: msg.sourceText || "",
+          translated: msg.translatedText || "",
+          time: new Date().toLocaleTimeString(),
+          lang: msg.sourceLang || "",
+        }]);
+      }
+      if (msg.confidence) {
+        setConfidence(Math.round(msg.confidence * 100));
+      }
+      if (msg.processingTime) {
+        setProcessingTime(Math.round(msg.processingTime * 1000));
+      }
+      if (msg.audio) {
+        enqueueAudio(msg.audio);
+      }
     };
 
     ws.onerror = stopCall;
@@ -212,9 +267,17 @@ export default function App() {
 
   /* ================= STOP ================= */
 
-  const stopCall = () => {
+  const stopCall = useCallback(() => {
     wsRef.current?.close();
     wsRef.current = null;
+
+    // Stop media stream
+    mediaStreamRef.current?.getTracks().forEach(track => track.stop());
+    mediaStreamRef.current = null;
+
+    // Disconnect worklet
+    workletRef.current?.disconnect();
+    workletRef.current = null;
 
     audioQueueRef.current = [];
     isPlayingRef.current = false;
@@ -225,7 +288,7 @@ export default function App() {
     setInCall(false);
     setStatus("idle");
     setSeconds(0);
-  };
+  }, []);
 
   /* ================= UI ================= */
 
@@ -240,7 +303,7 @@ export default function App() {
           transition={{ duration: 0.3 }}
           style={styles.card}
         >
-          <h2 style={styles.title}>Two-Way Live Translator</h2>
+          <h2 style={styles.title}>🌐 Two-Way Live Translator</h2>
 
           {!inCall && (
             <>
@@ -253,10 +316,10 @@ export default function App() {
 
               <div style={styles.row}>
                 <button style={btn(lang === "en")} onClick={() => setLang("en")}>
-                  Hear English
+                  🇬🇧 Hear English
                 </button>
                 <button style={btn(lang === "hi")} onClick={() => setLang("hi")}>
-                  Hear Hindi
+                  🇮🇳 Hear Hindi
                 </button>
               </div>
 
@@ -266,15 +329,15 @@ export default function App() {
               </p>
 
               <button style={styles.secondary} onClick={ensureAudioContext}>
-                Enable Audio
+                🔊 Enable Audio
               </button>
 
               <button
-                style={styles.primary}
+                style={{...styles.primary, opacity: audioUnlocked ? 1 : 0.5}}
                 onClick={startCall}
                 disabled={!audioUnlocked}
               >
-                Start Call
+                📞 Start Call
               </button>
             </>
           )}
@@ -284,26 +347,57 @@ export default function App() {
               <div style={styles.timer}>{formatTime()}</div>
 
               <motion.div
-                style={styles.mic}
+                style={{
+                  ...styles.mic,
+                  background: status === "speaking" ? "#f59e0b" : 
+                              status === "processing" ? "#3b82f6" : "#22c55e"
+                }}
                 animate={{ scale: 1 + micLevel / 300 }}
               />
 
               <p style={styles.status}>
-                {status === "listening" && "Listening…"}
-                {status === "processing" && "Translating…"}
-                {status === "speaking" && "Speaking…"}
+                {status === "listening" && "🎤 Listening…"}
+                {status === "processing" && "⚙️ Translating…"}
+                {status === "speaking" && "🔊 Speaking…"}
               </p>
 
+              {(confidence > 0 || processingTime > 0) && (
+                <div style={styles.metrics}>
+                  {confidence > 0 && <span>Confidence: {confidence}%</span>}
+                  {processingTime > 0 && <span>Latency: {processingTime}ms</span>}
+                </div>
+              )}
+
               <div style={styles.transcript}>
-                <b>Recognized</b>
-                <p>{recognized}</p>
-                <hr />
-                <b>Translated (You hear)</b>
-                <p>{translated}</p>
+                <div style={styles.transcriptSection}>
+                  <b>📝 Recognized</b>
+                  <p style={styles.transcriptText}>{recognized || "..."}</p>
+                </div>
+                <hr style={styles.divider} />
+                <div style={styles.transcriptSection}>
+                  <b>🔊 Translated (You hear)</b>
+                  <p style={styles.transcriptText}>{translated || "..."}</p>
+                </div>
               </div>
 
+              {history.length > 0 && (
+                <div style={styles.historyContainer}>
+                  <b style={styles.historyTitle}>📜 History</b>
+                  <div style={styles.historyScroll}>
+                    {history.map((item, i) => (
+                      <div key={i} style={styles.historyItem}>
+                        <span style={styles.historyTime}>{item.time}</span>
+                        <span style={styles.historyLang}>{item.lang.toUpperCase()}</span>
+                        <p style={styles.historySource}>{item.source}</p>
+                        <p style={styles.historyTranslated}>→ {item.translated}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <button style={styles.end} onClick={stopCall}>
-                End Call
+                📵 End Call
               </button>
             </>
           )}
@@ -322,12 +416,14 @@ const btn = (active: boolean) => ({
   border: "none",
   background: active ? "#22c55e" : "#1e293b",
   color: "white",
+  cursor: "pointer",
+  transition: "all 0.2s",
 });
 
-const styles: any = {
+const styles: Record<string, React.CSSProperties> = {
   page: {
     minHeight: "100vh",
-    background: "#020617",
+    background: "linear-gradient(135deg, #020617 0%, #0f172a 100%)",
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
@@ -335,65 +431,158 @@ const styles: any = {
   },
   card: {
     width: "100%",
-    maxWidth: 420,
-    background: "#020617",
+    maxWidth: 440,
+    background: "rgba(2, 6, 23, 0.95)",
     borderRadius: 24,
     padding: 24,
     color: "white",
-    boxShadow: "0 20px 40px rgba(0,0,0,.6)",
+    boxShadow: "0 25px 50px rgba(0,0,0,.7)",
+    border: "1px solid rgba(255,255,255,0.1)",
   },
-  title: { textAlign: "center", marginBottom: 12 },
+  title: { 
+    textAlign: "center", 
+    marginBottom: 16,
+    fontSize: 22,
+    fontWeight: 700,
+  },
   input: {
     width: "100%",
-    padding: 12,
+    padding: 14,
     borderRadius: 12,
-    border: "none",
+    border: "1px solid rgba(255,255,255,0.1)",
     marginBottom: 12,
+    background: "#0f172a",
+    color: "white",
+    fontSize: 16,
   },
-  row: { display: "flex", gap: 8, marginBottom: 8 },
+  row: { display: "flex", gap: 8, marginBottom: 12 },
   hint: {
     textAlign: "center",
     opacity: 0.7,
-    marginBottom: 12,
-    fontSize: 13,
+    marginBottom: 16,
+    fontSize: 14,
   },
   secondary: {
     width: "100%",
-    padding: 12,
+    padding: 14,
     background: "#0ea5e9",
     borderRadius: 12,
     border: "none",
-    marginBottom: 8,
+    marginBottom: 10,
+    cursor: "pointer",
+    fontWeight: 600,
+    color: "white",
   },
   primary: {
     width: "100%",
-    padding: 14,
-    background: "#22c55e",
+    padding: 16,
+    background: "linear-gradient(135deg, #22c55e 0%, #16a34a 100%)",
     borderRadius: 14,
     border: "none",
     fontWeight: 700,
+    cursor: "pointer",
+    fontSize: 16,
+    color: "white",
   },
-  timer: { textAlign: "center", fontSize: 18, marginBottom: 8 },
+  timer: { 
+    textAlign: "center", 
+    fontSize: 20, 
+    marginBottom: 8,
+    fontFamily: "monospace",
+    fontWeight: 600,
+  },
   mic: {
-    width: 60,
-    height: 60,
+    width: 70,
+    height: 70,
     borderRadius: "50%",
     background: "#22c55e",
-    margin: "12px auto",
+    margin: "16px auto",
+    boxShadow: "0 0 30px rgba(34, 197, 94, 0.4)",
   },
-  status: { textAlign: "center", opacity: 0.8 },
+  status: { 
+    textAlign: "center", 
+    opacity: 0.9,
+    fontSize: 15,
+    marginBottom: 12,
+  },
+  metrics: {
+    display: "flex",
+    justifyContent: "center",
+    gap: 20,
+    fontSize: 12,
+    opacity: 0.7,
+    marginBottom: 12,
+  },
   transcript: {
-    background: "#020617",
+    background: "rgba(15, 23, 42, 0.8)",
+    padding: 16,
+    borderRadius: 16,
+    marginBottom: 16,
+    border: "1px solid rgba(255,255,255,0.1)",
+  },
+  transcriptSection: {
+    marginBottom: 8,
+  },
+  transcriptText: {
+    margin: "8px 0 0 0",
+    fontSize: 15,
+    lineHeight: 1.5,
+    minHeight: 24,
+  },
+  divider: {
+    border: "none",
+    borderTop: "1px solid rgba(255,255,255,0.1)",
+    margin: "12px 0",
+  },
+  historyContainer: {
+    background: "rgba(15, 23, 42, 0.6)",
     padding: 12,
     borderRadius: 12,
-    marginBottom: 12,
+    marginBottom: 16,
+    maxHeight: 200,
+    overflow: "hidden",
+  },
+  historyTitle: {
+    fontSize: 13,
+    opacity: 0.8,
+  },
+  historyScroll: {
+    maxHeight: 160,
+    overflowY: "auto" as const,
+    marginTop: 8,
+  },
+  historyItem: {
+    padding: "8px 0",
+    borderBottom: "1px solid rgba(255,255,255,0.05)",
+    fontSize: 12,
+  },
+  historyTime: {
+    opacity: 0.5,
+    marginRight: 8,
+  },
+  historyLang: {
+    background: "rgba(255,255,255,0.1)",
+    padding: "2px 6px",
+    borderRadius: 4,
+    fontSize: 10,
+  },
+  historySource: {
+    margin: "4px 0 2px 0",
+    opacity: 0.7,
+  },
+  historyTranslated: {
+    margin: 0,
+    color: "#22c55e",
   },
   end: {
     width: "100%",
-    padding: 14,
-    background: "#ef4444",
+    padding: 16,
+    background: "linear-gradient(135deg, #ef4444 0%, #dc2626 100%)",
     borderRadius: 14,
     border: "none",
     fontWeight: 700,
+    cursor: "pointer",
+    fontSize: 16,
+    color: "white",
   },
 };

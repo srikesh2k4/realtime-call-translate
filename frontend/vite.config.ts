@@ -26,6 +26,20 @@ export default defineConfig({
     },
   },
 
+  preview: {
+    host: "0.0.0.0",
+    port: 5173,
+    // In Docker, proxy to backend service name
+    proxy: {
+      "/ws": {
+        target: process.env.BACKEND_URL || "ws://backend:8000",
+        ws: true,
+        changeOrigin: true,
+        secure: false,
+      },
+    },
+  },
+
   // Prevent Vite from optimizing WebSocket / ffmpeg deps incorrectly
   optimizeDeps: {
     exclude: ["@ffmpeg/ffmpeg"],

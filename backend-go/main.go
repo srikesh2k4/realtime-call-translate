@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,14 +18,28 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+/*
+🚀 OPTIMIZED GO WEBSOCKET SERVER FOR LIVE TRANSLATION
+=====================================================
+Key Optimizations:
+1. Per-speaker tracking with unique IDs
+2. Smart VAD-based audio segmentation
+3. Lower latency with smaller processing windows
+4. Connection health monitoring with ping/pong
+5. Graceful degradation under load
+*/
+
 /* ================= TYPES ================= */
 
 type Client struct {
-	conn   *websocket.Conn
-	room   string
-	lang   string
-	send   chan []byte
-	mlBusy int32
+	id       string
+	conn     *websocket.Conn
+	room     string
+	lang     string
+	send     chan []byte
+	sendBin  chan []byte // Binary channel for raw audio
+	mlBusy   int32
+	lastPing time.Time
 }
 
 type JoinMessage struct {
@@ -31,26 +48,56 @@ type JoinMessage struct {
 }
 
 type MLResponse struct {
-	Type           string `json:"type"`
-	SourceText     string `json:"sourceText"`
-	TranslatedText string `json:"translatedText"`
-	Audio          string `json:"audio"`
-	SourceLang     string `json:"sourceLang"`
-	TargetLang     string `json:"targetLang"`
+	Type           string  `json:"type"`
+	SourceText     string  `json:"sourceText"`
+	TranslatedText string  `json:"translatedText"`
+	Audio          string  `json:"audio"`
+	SourceLang     string  `json:"sourceLang"`
+	TargetLang     string  `json:"targetLang"`
+	Confidence     float64 `json:"confidence,omitempty"`
+	ProcessingTime float64 `json:"processingTime,omitempty"`
 }
 
-/* ================= AUDIO ================= */
+/* ================= AUDIO STATE ================= */
 
 type AudioState struct {
-	samples []float32
+	samples         []float32
+	lastActivity    time.Time
+	isSpeaking      bool
+	speechStartTime time.Time
+	silenceSamples  int
 }
+
+/* ================= CONFIGURATION ================= */
+
+const (
+	// Audio settings - optimized for low latency
+	SAMPLE_RATE = 16000
+
+	// Smaller window for lower latency (changed from 2.5s)
+	MIN_SAMPLES = SAMPLE_RATE * 1 / 2 // 500ms minimum
+	MAX_SAMPLES = SAMPLE_RATE * 15    // 15s maximum for long speech
+
+	// Silence detection - end of utterance
+	SILENCE_THRESHOLD_SAMPLES = SAMPLE_RATE * 6 / 10 // 600ms silence = end of utterance
+	RMS_THRESHOLD             = 0.003
+
+	// WebSocket settings
+	WRITE_WAIT       = 10 * time.Second
+	PONG_WAIT        = 60 * time.Second
+	PING_PERIOD      = 30 * time.Second
+	MAX_MESSAGE_SIZE = 1024 * 1024 // 1MB
+
+	// ML settings
+	ML_TIMEOUT = 60 * time.Second
+)
 
 /* ================= GLOBALS ================= */
 
 var (
 	upgrader = websocket.Upgrader{
-		ReadBufferSize:  8192,
-		WriteBufferSize: 8192,
+		ReadBufferSize:  16384,
+		WriteBufferSize: 16384,
 		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
 
@@ -58,31 +105,101 @@ var (
 	audioBuffers = map[*Client]*AudioState{}
 	mu           sync.RWMutex
 
-	httpClient = &http.Client{Timeout: 120 * time.Second}
+	httpClient = &http.Client{
+		Timeout: ML_TIMEOUT,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
 
-	// MUST MATCH BACKEND (2.5s @ 16k)
-	WINDOW_SAMPLES = 16000 * 25 / 10
+	// Metrics
+	activeConnections int64
+	totalProcessed    int64
+	clientCounter     int64
 )
+
+/* ================= HELPERS ================= */
+
+func calculateRMS(samples []float32) float64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, s := range samples {
+		sum += float64(s) * float64(s)
+	}
+	return math.Sqrt(sum / float64(len(samples)))
+}
+
+func hasVoiceActivity(samples []float32) bool {
+	return calculateRMS(samples) > RMS_THRESHOLD
+}
+
+func generateClientID() string {
+	id := atomic.AddInt64(&clientCounter, 1)
+	return fmt.Sprintf("c%d", id)
+}
+
+func getMLEndpoint() string {
+	// Check for Docker environment (ML_WORKER_HOST env var)
+	if host := os.Getenv("ML_WORKER_HOST"); host != "" {
+		return "http://" + host + ":9001"
+	}
+	// Default to localhost for local development
+	return "http://127.0.0.1:9001"
+}
 
 /* ================= WS HANDLER ================= */
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Printf("Upgrade error: %v", err)
 		return
 	}
 
+	// Configure connection
+	conn.SetReadLimit(MAX_MESSAGE_SIZE)
+	conn.SetReadDeadline(time.Now().Add(PONG_WAIT))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(PONG_WAIT))
+		return nil
+	})
+
 	client := &Client{
-		conn: conn,
-		send: make(chan []byte, 64),
+		id:       generateClientID(),
+		conn:     conn,
+		send:     make(chan []byte, 128),
+		sendBin:  make(chan []byte, 64),
+		lastPing: time.Now(),
 	}
 
 	mu.Lock()
-	audioBuffers[client] = &AudioState{}
+	audioBuffers[client] = &AudioState{
+		lastActivity: time.Now(),
+	}
+	atomic.AddInt64(&activeConnections, 1)
 	mu.Unlock()
 
 	go writePump(client)
+	go pingPump(client)
 	readPump(client)
+}
+
+/* ================= PING PUMP ================= */
+
+func pingPump(c *Client) {
+	ticker := time.NewTicker(PING_PERIOD)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.conn.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
+		if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			return
+		}
+	}
 }
 
 /* ================= READ LOOP ================= */
@@ -93,12 +210,15 @@ func readPump(c *Client) {
 	for {
 		msgType, data, err := c.conn.ReadMessage()
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("Read error: %v", err)
+			}
 			return
 		}
 
 		if msgType == websocket.TextMessage {
 			var join JoinMessage
-			if json.Unmarshal(data, &join) == nil {
+			if json.Unmarshal(data, &join) == nil && join.Room != "" && join.Lang != "" {
 				joinRoom(c, join.Room, join.Lang)
 			}
 			continue
@@ -110,10 +230,10 @@ func readPump(c *Client) {
 	}
 }
 
-/* ================= AUDIO ================= */
+/* ================= AUDIO HANDLING ================= */
 
 func handleAudio(c *Client, data []byte) {
-	if len(data)%4 != 0 {
+	if len(data)%4 != 0 || c.room == "" {
 		return
 	}
 
@@ -125,29 +245,98 @@ func handleAudio(c *Client, data []byte) {
 	mu.Lock()
 	state := audioBuffers[c]
 	state.samples = append(state.samples, samples...)
+	state.lastActivity = time.Now()
 
-	if len(state.samples) < WINDOW_SAMPLES || atomic.LoadInt32(&c.mlBusy) == 1 {
+	// Voice activity detection
+	hasVoice := hasVoiceActivity(samples)
+
+	if hasVoice {
+		if !state.isSpeaking {
+			state.isSpeaking = true
+			state.speechStartTime = time.Now()
+		}
+		state.silenceSamples = 0
+	} else {
+		state.silenceSamples += len(samples)
+	}
+
+	// Decide when to process
+	shouldProcess := false
+	totalSamples := len(state.samples)
+
+	// End of utterance: silence after speech
+	if state.isSpeaking && state.silenceSamples > SILENCE_THRESHOLD_SAMPLES && totalSamples >= MIN_SAMPLES {
+		shouldProcess = true
+		state.isSpeaking = false
+	}
+
+	// Force process on max samples (long speech)
+	if totalSamples >= MAX_SAMPLES {
+		shouldProcess = true
+	}
+
+	// Skip if already processing
+	if atomic.LoadInt32(&c.mlBusy) == 1 {
 		mu.Unlock()
 		return
 	}
 
-	audio := make([]float32, WINDOW_SAMPLES)
-	copy(audio, state.samples[:WINDOW_SAMPLES])
-	state.samples = state.samples[WINDOW_SAMPLES:]
+	if !shouldProcess {
+		mu.Unlock()
+		return
+	}
+
+	// Extract audio for processing
+	var audio []float32
+	if state.silenceSamples > SILENCE_THRESHOLD_SAMPLES {
+		// End of utterance - take all
+		audio = make([]float32, len(state.samples))
+		copy(audio, state.samples)
+		state.samples = state.samples[:0]
+	} else {
+		// Long speech - take chunk but keep overlap
+		audio = make([]float32, MAX_SAMPLES)
+		copy(audio, state.samples[:MAX_SAMPLES])
+		// Keep last 0.5s for continuity
+		keepSamples := SAMPLE_RATE / 2
+		if len(state.samples) > keepSamples {
+			state.samples = state.samples[len(state.samples)-keepSamples:]
+		}
+	}
+
 	atomic.StoreInt32(&c.mlBusy, 1)
 	mu.Unlock()
 
 	go forward(c, audio)
 }
 
-/* ================= WRITE ================= */
+/* ================= WRITE PUMP ================= */
 
 func writePump(c *Client) {
 	defer c.conn.Close()
 
-	for msg := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			return
+	for {
+		select {
+		case msg, ok := <-c.send:
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			c.conn.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+
+		case bin, ok := <-c.sendBin:
+			if !ok {
+				return
+			}
+
+			c.conn.SetWriteDeadline(time.Now().Add(WRITE_WAIT))
+			if err := c.conn.WriteMessage(websocket.BinaryMessage, bin); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -158,6 +347,12 @@ func joinRoom(c *Client, room, lang string) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Leave old room
+	if c.room != "" && rooms[c.room] != nil {
+		delete(rooms[c.room], c)
+	}
+
+	// Join new room
 	if rooms[room] == nil {
 		rooms[room] = map[*Client]bool{}
 	}
@@ -166,7 +361,7 @@ func joinRoom(c *Client, room, lang string) {
 	c.lang = lang
 	rooms[room][c] = true
 
-	log.Println("Joined:", room, "lang:", lang)
+	log.Printf("✅ [%s] Joined room '%s' with lang '%s'", c.id, room, lang)
 }
 
 /* ================= CLEANUP ================= */
@@ -178,100 +373,158 @@ func cleanup(c *Client) {
 	delete(audioBuffers, c)
 	if c.room != "" {
 		delete(rooms[c.room], c)
+		if len(rooms[c.room]) == 0 {
+			delete(rooms, c.room)
+		}
 	}
+
 	close(c.send)
-	_ = c.conn.Close()
+	close(c.sendBin)
+	c.conn.Close()
+
+	atomic.AddInt64(&activeConnections, -1)
+	log.Printf("👋 [%s] Disconnected", c.id)
 }
 
-/* ================= FORWARD ================= */
+/* ================= FORWARD TO ML ================= */
 
 func forward(sender *Client, pcm []float32) {
 	defer atomic.StoreInt32(&sender.mlBusy, 0)
 
-	/* ---------- RAW AUDIO (SAME LANG) ---------- */
+	startTime := time.Now()
 
+	/* ---------- RELAY RAW AUDIO TO SAME LANGUAGE PEERS ---------- */
 	mu.RLock()
+	peers := make([]*Client, 0)
+	mlNeeded := false
+
 	for peer := range rooms[sender.room] {
-		if peer != sender && peer.lang == sender.lang {
-			buf := new(bytes.Buffer)
-			_ = binary.Write(buf, binary.LittleEndian, pcm)
-			peer.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+		if peer == sender {
+			continue
+		}
+		if peer.lang == sender.lang {
+			peers = append(peers, peer)
+		} else {
+			mlNeeded = true
 		}
 	}
 	mu.RUnlock()
 
-	/* ---------- CHECK IF ML IS NEEDED ---------- */
+	// Send raw audio to same-language peers
+	if len(peers) > 0 {
+		buf := new(bytes.Buffer)
+		binary.Write(buf, binary.LittleEndian, pcm)
+		audioBytes := buf.Bytes()
 
-	needML := false
-	mu.RLock()
-	for peer := range rooms[sender.room] {
-		if peer.lang != sender.lang {
-			needML = true
-			break
+		for _, peer := range peers {
+			select {
+			case peer.sendBin <- audioBytes:
+			default:
+				// Channel full, skip
+			}
 		}
 	}
-	mu.RUnlock()
 
-	if !needML {
+	/* ---------- ML PROCESSING FOR DIFFERENT LANGUAGES ---------- */
+	if !mlNeeded {
 		return
 	}
 
-	/* ---------- ML REQUEST ---------- */
-
+	// Prepare audio buffer
 	buf := new(bytes.Buffer)
-	_ = binary.Write(buf, binary.LittleEndian, pcm)
+	binary.Write(buf, binary.LittleEndian, pcm)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), ML_TIMEOUT)
 	defer cancel()
 
-	req, _ := http.NewRequestWithContext(
+	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
-		"http://127.0.0.1:9001/process",
+		getMLEndpoint()+"/process",
 		buf,
 	)
+	if err != nil {
+		log.Printf("Request creation error: %v", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Room", sender.room)
 	req.Header.Set("X-Speaker-Lang", sender.lang)
+	req.Header.Set("X-Speaker-Id", sender.id)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		log.Println("ML error:", err)
+		log.Printf("ML request error: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("ML response status: %d", resp.StatusCode)
+		return
+	}
+
 	body, err := io.ReadAll(resp.Body)
-	if err != nil || !json.Valid(body) {
+	if err != nil || len(body) == 0 {
 		return
 	}
 
 	var results []MLResponse
-	if json.Unmarshal(body, &results) != nil {
+	if err := json.Unmarshal(body, &results); err != nil {
 		return
 	}
 
-	/* ---------- DISPATCH ---------- */
+	if len(results) == 0 {
+		return
+	}
 
+	atomic.AddInt64(&totalProcessed, 1)
+	elapsed := time.Since(startTime)
+	log.Printf("📨 [%s] Processed %d results in %v", sender.id, len(results), elapsed)
+
+	/* ---------- DISPATCH TO TARGET LANGUAGE PEERS ---------- */
 	mu.RLock()
 	defer mu.RUnlock()
 
 	for _, res := range results {
 		for peer := range rooms[sender.room] {
-			if peer.lang == res.TargetLang {
+			if peer.lang == res.TargetLang && peer != sender {
 				b, _ := json.Marshal(res)
 				select {
 				case peer.send <- b:
 				default:
+					log.Printf("⚠️ [%s] Send buffer full", peer.id)
 				}
 			}
 		}
 	}
 }
 
+/* ================= HEALTH ENDPOINT ================= */
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	roomCount := len(rooms)
+	mu.RUnlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":      "healthy",
+		"connections": atomic.LoadInt64(&activeConnections),
+		"rooms":       roomCount,
+		"processed":   atomic.LoadInt64(&totalProcessed),
+	})
+}
+
 /* ================= MAIN ================= */
 
 func main() {
-	log.Println("🚀 Go WebSocket server running on :8000")
+	log.Println("🚀 Optimized Go WebSocket server starting on :8000")
+	log.Printf("📊 Config: MinSamples=%d, MaxSamples=%d, SilenceThreshold=%d",
+		MIN_SAMPLES, MAX_SAMPLES, SILENCE_THRESHOLD_SAMPLES)
+
 	http.HandleFunc("/ws", wsHandler)
+	http.HandleFunc("/health", healthHandler)
+
 	log.Fatal(http.ListenAndServe("0.0.0.0:8000", nil))
 }
