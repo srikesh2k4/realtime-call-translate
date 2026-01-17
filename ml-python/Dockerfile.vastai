@@ -1,0 +1,129 @@
+# ============================================
+# 🚀 VAST.AI RTX 4090 OPTIMIZED DOCKERFILE
+# ============================================
+# Optimized for:
+# - NVIDIA RTX 4090 (Ada Lovelace, SM 8.9)
+# - vast.ai cloud GPU instances
+# - Maximum performance with FP16/BF16
+# ============================================
+
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# ============================================
+# System Dependencies
+# ============================================
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    ffmpeg \
+    libsndfile1 \
+    libsndfile1-dev \
+    curl \
+    wget \
+    git \
+    htop \
+    nvtop \
+    tmux \
+    vim \
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.11 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+# ============================================
+# SSH Setup for vast.ai access
+# ============================================
+RUN mkdir /var/run/sshd
+RUN echo 'root:vastai' | chpasswd
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+RUN sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+EXPOSE 22
+
+WORKDIR /app
+
+# ============================================
+# CUDA Environment for RTX 4090 (Ada Lovelace)
+# ============================================
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# RTX 4090 specific optimizations
+ENV TORCH_CUDA_ARCH_LIST="8.9"
+ENV NVIDIA_TF32_OVERRIDE=1
+
+# CTranslate2 optimizations
+ENV CT2_CUDA_ALLOW_FP16=1
+ENV CT2_CUDA_ALLOW_BF16=1
+ENV CT2_CUDA_CACHING_ALLOCATOR_CONFIG=max_split_size_mb:1024
+
+# PyTorch memory management for 24GB VRAM
+ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:1024,expandable_segments:True,garbage_collection_threshold:0.8
+
+# ============================================
+# Install PyTorch 2.2 with CUDA 12.1 (RTX 4090 optimized)
+# ============================================
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+RUN pip install --no-cache-dir \
+    torch==2.2.0 \
+    torchaudio==2.2.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+# ============================================
+# Install ML Dependencies
+# ============================================
+# CTranslate2 with CUDA (faster-whisper backend)
+RUN pip install --no-cache-dir ctranslate2>=4.0.0
+
+# faster-whisper (CTranslate2-based Whisper)
+RUN pip install --no-cache-dir faster-whisper>=1.0.0
+
+# Copy and install requirements
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ============================================
+# Pre-download Models (faster startup)
+# ============================================
+# Download Whisper large-v3 (best quality for 4090)
+RUN python -c "from faster_whisper import WhisperModel; print('Downloading large-v3...'); WhisperModel('large-v3', device='cuda', compute_type='float16')" || echo "Model will download on first run"
+
+# Download Silero VAD
+RUN python -c "from silero_vad import load_silero_vad; load_silero_vad()" || true
+
+# ============================================
+# Copy Application
+# ============================================
+COPY worker.py .
+COPY .env* ./
+
+# ============================================
+# Expose Ports
+# ============================================
+# ML Worker API
+EXPOSE 9001
+# SSH
+EXPOSE 22
+
+# ============================================
+# Health Check
+# ============================================
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:9001/health || exit 1
+
+# ============================================
+# Startup Script
+# ============================================
+COPY --chmod=755 start-vastai.sh /start.sh
+
+CMD ["/start.sh"]

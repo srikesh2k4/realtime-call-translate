@@ -16,7 +16,7 @@
 
 ### For NVIDIA GPU (Recommended)
 - **GPU**: NVIDIA RTX 2060 or better (6GB+ VRAM)
-- **Recommended**: RTX 3080/4080 for best performance
+- **Recommended**: RTX 3080/4080/4090 for best performance
 - **RAM**: 16GB+
 - **Driver**: NVIDIA Driver 525+ with CUDA 12.1
 
@@ -25,7 +25,14 @@
 - **RAM**: 16GB+
 - **Note**: ~3-5x higher latency than GPU
 
-## 📦 Quick Start
+### ☁️ Cloud GPU (vast.ai)
+- **Recommended**: RTX 4090 (~$0.40-0.80/hr)
+- **Minimum**: RTX 3080 or better
+- See [vast.ai Deployment Guide](#-vastai-deployment-guide) below
+
+---
+
+## 📦 Quick Start (Local)
 
 ### Prerequisites
 
@@ -145,7 +152,239 @@ http://localhost:5173
                                                                     └───────────┘
 ```
 
-## 🐛 Troubleshooting
+---
+
+## ☁️ vast.ai Deployment Guide
+
+Deploy on **vast.ai** to get RTX 4090 performance at ~$0.40-0.80/hour!
+
+### Why vast.ai?
+
+| Feature | vast.ai | AWS/GCP | Local |
+|---------|---------|---------|-------|
+| RTX 4090 Cost | $0.40-0.80/hr | $3-5/hr | $2000+ upfront |
+| Setup Time | 5 minutes | 30+ minutes | Hours |
+| Maintenance | None | Complex | Required |
+| Scaling | Instant | Minutes | Buy more hardware |
+
+### Prerequisites
+
+1. **vast.ai Account**: Sign up at [vast.ai](https://vast.ai)
+2. **OpenAI API Key**: For translation and TTS
+3. **vast.ai CLI** (optional): `pip install vastai`
+
+---
+
+### 🚀 Method 1: Web UI (Easiest)
+
+#### Step 1: Find an RTX 4090 Instance
+
+1. Go to [vast.ai Console](https://cloud.vast.ai/create/)
+2. Set filters:
+   - **GPU**: RTX 4090
+   - **CUDA**: >= 12.0
+   - **Disk**: >= 50 GB
+   - **Reliability**: >= 95%
+3. Sort by **$/hr** (cheapest first)
+4. Click **RENT** on your preferred instance
+
+#### Step 2: Configure Instance
+
+- **Image**: `nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04`
+- **Disk Space**: 50 GB
+- **Docker Options**: Enable SSH
+- **On-start Script**:
+```bash
+apt-get update && apt-get install -y git curl
+```
+
+#### Step 3: Connect via SSH
+
+After instance starts (~1-2 minutes):
+```bash
+# Copy SSH command from vast.ai console
+ssh -p <PORT> root@<HOST>
+```
+
+#### Step 4: Deploy the Application
+
+```bash
+# Clone repository
+git clone https://github.com/srikesh2k4/realtime-call-translate.git
+cd realtime-call-translate
+
+# Make script executable
+chmod +x deploy-vastai-instance.sh
+
+# Run setup (will prompt for OpenAI API key)
+./deploy-vastai-instance.sh
+```
+
+#### Step 5: Configure Port Forwarding
+
+1. In vast.ai console, go to your instance
+2. Click **Open Ports** / **Port Mapping**
+3. Add port **9001** (HTTP)
+4. Copy the public URL
+
+#### Step 6: Connect Local Frontend
+
+On your **local machine**:
+```bash
+# Set environment variable to point to vast.ai
+export ML_WORKER_URL=http://<VAST_AI_IP>:9001
+
+# Start local backend + frontend
+docker compose -f docker-compose.cpu.yml up backend frontend
+```
+
+Or update `backend-go/main.go`:
+```go
+// Change ML_WORKER_HOST to your vast.ai IP
+```
+
+---
+
+### 🚀 Method 2: CLI Script (Automated)
+
+#### Step 1: Install vast.ai CLI
+
+```bash
+pip install vastai
+```
+
+#### Step 2: Set API Key
+
+```bash
+# Get API key from https://cloud.vast.ai/account/
+export VASTAI_API_KEY="your-api-key"
+vastai set api-key $VASTAI_API_KEY
+```
+
+#### Step 3: Run Deployment Script
+
+```bash
+# Set OpenAI key
+export OPENAI_API_KEY="your-openai-key"
+
+# Run automated deployment
+chmod +x deploy-vastai.sh
+./deploy-vastai.sh
+```
+
+The script will:
+1. Search for cheapest RTX 4090 instances
+2. Create and start the instance
+3. Provide SSH connection details
+
+#### Step 4: Complete Setup on Instance
+
+```bash
+# SSH into instance (command provided by script)
+ssh -p <PORT> root@<HOST>
+
+# Run instance setup
+cd realtime-call-translate
+./deploy-vastai-instance.sh
+```
+
+---
+
+### � Method 3: Docker Compose on vast.ai
+
+For running the **entire stack** on vast.ai:
+
+#### Step 1: Create Instance with Docker
+
+1. Rent RTX 4090 instance on vast.ai
+2. Use image: `nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04`
+3. Enable Docker mode
+
+#### Step 2: Deploy Full Stack
+
+```bash
+# SSH into instance
+ssh -p <PORT> root@<HOST>
+
+# Install Docker Compose
+apt-get update && apt-get install -y docker-compose-plugin
+
+# Clone and deploy
+git clone https://github.com/srikesh2k4/realtime-call-translate.git
+cd realtime-call-translate
+
+# Create .env file
+echo "OPENAI_API_KEY=your-key" > ml-python/.env
+
+# Deploy with vast.ai optimized config
+docker compose -f docker-compose.vastai.yml up --build -d
+```
+
+#### Step 3: Access the App
+
+Open ports in vast.ai:
+- **5173**: Frontend
+- **8000**: Backend
+- **9001**: ML Worker (optional)
+
+Access: `http://<VAST_AI_IP>:5173`
+
+---
+
+### 📊 vast.ai Performance & Cost
+
+#### RTX 4090 Performance (24GB VRAM)
+| Metric | Value |
+|--------|-------|
+| ASR Latency | ~150-200ms |
+| End-to-End | ~400-600ms |
+| Concurrent Speakers | 8-10 |
+| Model | large-v3 (float16) |
+
+#### Cost Estimates
+| Usage | Hourly | Daily | Monthly |
+|-------|--------|-------|---------|
+| Light (4 hrs/day) | $0.50 | $2 | $60 |
+| Medium (8 hrs/day) | $0.50 | $4 | $120 |
+| Heavy (24/7) | $0.50 | $12 | $360 |
+
+*Prices vary based on availability. RTX 4090 typically $0.40-0.80/hr*
+
+---
+
+### 🔧 vast.ai Troubleshooting
+
+#### Instance won't start
+```bash
+# Check instance status
+vastai show instances
+
+# Destroy and recreate
+vastai destroy instance <ID>
+```
+
+#### Port not accessible
+1. Check vast.ai port forwarding settings
+2. Ensure firewall allows the port
+3. Try direct IP mode
+
+#### GPU not detected in container
+```bash
+# Verify GPU access
+nvidia-smi
+
+# Check CUDA
+python3 -c "import torch; print(torch.cuda.is_available())"
+```
+
+#### High latency
+1. Choose instance closer to your location
+2. Check network speed: `speedtest-cli`
+3. Use instance with higher inet_down rating
+
+---
+
+## �🐛 General Troubleshooting
 
 ### GPU not detected
 ```bash
@@ -179,3 +418,4 @@ MIT License - see [LICENSE](LICENSE)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) - CUDA-optimized Whisper
 - [Silero VAD](https://github.com/snakers4/silero-vad) - Voice Activity Detection
 - [OpenAI](https://openai.com) - Translation & TTS APIs
+- [vast.ai](https://vast.ai) - Affordable cloud GPUs
