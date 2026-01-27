@@ -1,0 +1,67 @@
+# ============================================
+# 🚀 NGROK CONFIGURATION
+# ============================================
+# Multi-tunnel configuration for live translation
+# ============================================
+
+version: "2"
+authtoken: YOUR_NGROK_AUTHTOKEN_HERE
+
+# Web dashboard
+web_addr: localhost:4040
+
+tunnels:
+  # Frontend - React UI
+  frontend:
+    proto: http
+    addr: 5173
+    inspect: true
+    # Optional: custom subdomain (requires paid plan)
+    # subdomain: my-translator
+  
+  # Backend - WebSocket
+  backend:
+    proto: http
+    addr: 8000
+    inspect: true
+    # Optional: custom subdomain
+    # subdomain: my-translator-ws
+  
+  # ML Worker (optional, for debugging)
+  ml-worker:
+    proto: http
+    addr: 9001
+    inspect: false
+
+# ============================================
+# SETUP INSTRUCTIONS:
+# ============================================
+# 1. Sign up at: https://ngrok.com/
+#
+# 2. Get your authtoken from: 
+#    https://dashboard.ngrok.com/get-started/your-authtoken
+#
+# 3. Replace YOUR_NGROK_AUTHTOKEN_HERE above
+#    OR authenticate via CLI:
+#    ngrok config add-authtoken <YOUR_TOKEN>
+#
+# 4. Start all tunnels:
+#    ngrok start --all --config ngrok.yml
+#
+#    OR use the helper script:
+#    chmod +x start-ngrok.sh
+#    ./start-ngrok.sh
+#
+# 5. View dashboard at: http://localhost:4040
+#
+# ============================================
+# FRONTEND CONFIGURATION:
+# ============================================
+# After starting ngrok, update your frontend WS URL:
+# 
+# In frontend/src/App.tsx, change:
+#   const WS_URL = "wss://YOUR-BACKEND-URL.ngrok-free.app/ws"
+#
+# Or set via environment:
+#   VITE_WS_URL=wss://YOUR-BACKEND-URL.ngrok-free.app/ws npm run dev
+# ============================================

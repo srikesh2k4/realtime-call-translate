@@ -1,0 +1,122 @@
+# ============================================
+# 🚀 RTX 5090 (BLACKWELL) OPTIMIZED DOCKERFILE v3.0
+# ============================================
+# CUDA 12.4 + cuDNN 9 for RTX 5090
+# Local NLLB-3.3B translation - NO API DEPENDENCY
+# Languages: English, Hindi, Telugu (all 6 pairs)
+# ============================================
+
+FROM nvidia/cuda:12.4.0-cudnn-devel-ubuntu22.04
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# System dependencies
+RUN apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    ffmpeg \
+    libsndfile1 \
+    libsndfile1-dev \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.11 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip
+
+WORKDIR /app
+
+# ============================================
+# CUDA Environment for RTX 5090 (Blackwell SM 10.0)
+# ============================================
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=${CUDA_HOME}/bin:${PATH}
+ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
+
+# RTX 5090 specific optimizations
+ENV TORCH_CUDA_ARCH_LIST="9.0;10.0"
+ENV NVIDIA_TF32_OVERRIDE=1
+ENV CUDA_MODULE_LOADING=LAZY
+
+# PyTorch optimizations
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:1024,garbage_collection_threshold:0.9
+
+# CTranslate2 optimizations
+ENV CT2_CUDA_ALLOW_FP16=1
+ENV CT2_CUDA_ALLOW_BF16=1
+ENV CT2_CUDA_CACHING_ALLOCATOR_CONFIG=max_split_size_mb:1024
+
+# Tokenizer parallelism
+ENV TOKENIZERS_PARALLELISM=false
+
+# ============================================
+# Install PyTorch with CUDA 12.4
+# ============================================
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# PyTorch 2.3+ with CUDA 12.4 support
+RUN pip install --no-cache-dir \
+    torch>=2.3.0 \
+    torchaudio>=2.3.0 \
+    --index-url https://download.pytorch.org/whl/cu124
+
+# ============================================
+# Install ML Dependencies
+# ============================================
+# CTranslate2 for faster-whisper
+RUN pip install --no-cache-dir ctranslate2>=4.0.0
+
+# faster-whisper for ASR
+RUN pip install --no-cache-dir faster-whisper>=1.0.0
+
+# Transformers for NLLB translation
+RUN pip install --no-cache-dir \
+    transformers>=4.37.0 \
+    sentencepiece>=0.1.99 \
+    accelerate>=0.26.0 \
+    optimum>=1.17.0
+
+# ============================================
+# Install Other Dependencies
+# ============================================
+COPY requirements_v3.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ============================================
+# Pre-download Models (faster startup)
+# ============================================
+# Download Whisper large-v3-turbo
+RUN python3 -c "from faster_whisper import WhisperModel; \
+    print('Downloading Whisper large-v3-turbo...'); \
+    WhisperModel('large-v3-turbo', device='cpu', compute_type='float32')" || true
+
+# Download NLLB-200-3.3B translation model (HIGHEST ACCURACY)
+RUN python3 -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; \
+    print('Downloading NLLB-200-3.3B (this may take 10-15 minutes)...'); \
+    AutoTokenizer.from_pretrained('facebook/nllb-200-3.3B'); \
+    AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-3.3B', torch_dtype='auto')" || true
+
+# Download Silero VAD
+RUN python3 -c "from silero_vad import load_silero_vad; \
+    print('Downloading Silero VAD...'); \
+    load_silero_vad()" || true
+
+# ============================================
+# Copy Application (v3.0 with Hindi/English/Telugu)
+# ============================================
+COPY worker_v3.py worker.py
+
+EXPOSE 9001
+
+# Health check (longer start period for 3.3B model)
+HEALTHCHECK --interval=30s --timeout=20s --start-period=300s --retries=5 \
+    CMD curl -f http://localhost:9001/health || exit 1
+
+# Run with optimized settings
+CMD ["python3", "-m", "uvicorn", "worker:app", "--host", "0.0.0.0", "--port", "9001", "--workers", "1", "--timeout-keep-alive", "300"]

@@ -1,0 +1,34 @@
+# ============================================
+# 🌐 CLOUDFLARE TUNNEL CONFIGURATION
+# ============================================
+# Exposes your local translation app securely to the internet
+# No port forwarding or firewall changes needed
+# ============================================
+
+tunnel: YOUR_TUNNEL_ID_HERE
+credentials-file: /root/.cloudflared/YOUR_TUNNEL_ID_HERE.json
+
+ingress:
+  # Frontend (React App)
+  - hostname: translate.yourdomain.com
+    service: http://frontend:5173
+    originRequest:
+      noTLSVerify: true
+  
+  # WebSocket Backend
+  - hostname: ws.yourdomain.com
+    service: http://backend:8000
+    originRequest:
+      noTLSVerify: true
+  
+  # ML Worker API (optional - for direct API access)
+  - hostname: api.yourdomain.com
+    service: http://ml-worker:9001
+    originRequest:
+      noTLSVerify: true
+  
+  # Catch-all (required)
+  - service: http_status:404
+
+# Logging
+loglevel: info

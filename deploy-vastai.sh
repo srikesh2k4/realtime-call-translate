@@ -81,7 +81,7 @@ echo -e "${BLUE}🚀 Creating vast.ai instance...${NC}"
 # Using CUDA 12.1 base image with SSH
 vastai create instance $INSTANCE_ID \
     --image nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 \
-    --disk 50 \
+    --disk 60 \
     --ssh \
     --direct \
     --env "OPENAI_API_KEY=$OPENAI_API_KEY" \

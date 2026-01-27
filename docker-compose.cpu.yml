@@ -1,6 +1,9 @@
-# GPU vs CPU Docker Compose configs
+# ============================================
+# CPU VERSION - LOCAL TRANSLATION (No API)
+# ============================================
+version: "3.9"
+
 services:
-  # Use this for systems WITHOUT NVIDIA GPU
   ml-worker:
     build:
       context: ./ml-python
@@ -8,19 +11,22 @@ services:
     ports:
       - "9001:9001"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - WHISPER_MODEL=distil-large-v3  # Faster model for CPU
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - WHISPER_MODEL=base
+      - WHISPER_COMPUTE=float32
+      - NLLB_MODEL=facebook/nllb-200-distilled-600M
       - BATCH_SIZE=1
+      - USE_LOCAL_TTS=false
     volumes:
       - ./ml-python/.env:/app/.env:ro
       - huggingface_cache:/root/.cache/huggingface
-    restart: unless-stopped
+    restart: always
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
       interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
+      timeout: 15s
+      retries: 5
+      start_period: 180s
 
   backend:
     build:
@@ -30,9 +36,11 @@ services:
       - "8000:8000"
     environment:
       - ML_WORKER_HOST=ml-worker
+      - ML_WORKER_PORT=9001
     depends_on:
-      - ml-worker
-    restart: unless-stopped
+      ml-worker:
+        condition: service_healthy
+    restart: always
 
   frontend:
     build:
@@ -42,7 +50,7 @@ services:
       - "5173:5173"
     depends_on:
       - backend
-    restart: unless-stopped
+    restart: always
 
 volumes:
   huggingface_cache:

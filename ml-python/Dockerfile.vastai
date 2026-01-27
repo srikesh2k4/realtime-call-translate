@@ -32,6 +32,9 @@ RUN apt-get update && apt-get install -y \
     tmux \
     vim \
     openssh-server \
+    # For optimization compilations
+    build-essential \
+    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Python 3.11 as default
@@ -95,11 +98,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ============================================
 # Pre-download Models (faster startup)
 # ============================================
-# Download Whisper large-v3 (best quality for 4090)
-RUN python -c "from faster_whisper import WhisperModel; print('Downloading large-v3...'); WhisperModel('large-v3', device='cuda', compute_type='float16')" || echo "Model will download on first run"
+# Download Whisper large-v3-turbo (fastest/accurate)
+RUN python -c "from faster_whisper import WhisperModel; print('Downloading large-v3-turbo...'); WhisperModel('large-v3-turbo', device='cuda', compute_type='float16')" || echo "Model will download on first run"
 
 # Download Silero VAD
 RUN python -c "from silero_vad import load_silero_vad; load_silero_vad()" || true
+
+# Download NLLB-200-3.3B (Local Translation) - ~7GB
+RUN python -c "from transformers import AutoTokenizer, AutoModelForSeq2SeqLM; print('Downloading NLLB-3.3B...'); AutoTokenizer.from_pretrained('facebook/nllb-200-3.3B'); AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-3.3B')" || echo "NLLB will download on first run"
 
 # ============================================
 # Copy Application

@@ -1,0 +1,46 @@
+# ============================================
+# 🚀 LIVE CALL TRANSLATION v3.0
+# Hindi / English / Telugu - All 6 Translation Pairs
+# RTX 5090 Optimized - NO API DEPENDENCY
+# ============================================
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Audio Processing
+numpy>=1.26.0
+soundfile>=0.12.0
+scipy>=1.12.0
+librosa>=0.10.0
+
+# Noise Reduction
+noisereduce>=3.0.0
+# deepfilternet  # Optional: GPU noise reduction (install separately)
+
+# VAD (Voice Activity Detection)
+silero-vad>=5.1
+
+# ASR (Speech Recognition) - Whisper large-v3-turbo
+faster-whisper>=1.0.0
+ctranslate2>=4.0.0
+
+# Translation (LOCAL NLLB-200-3.3B - No API!)
+transformers>=4.37.0
+sentencepiece>=0.1.99
+protobuf>=4.25.0
+accelerate>=0.26.0
+
+# Speed Optimization
+optimum>=1.17.0
+
+# TTS (Optional - OpenAI or local)
+openai>=1.12.0
+# TTS>=0.22.0  # Optional: Local TTS (large, install separately)
+
+# Environment
+python-dotenv>=1.0.0
+
+# Utilities
+aiofiles>=23.0.0
+httpx>=0.26.0

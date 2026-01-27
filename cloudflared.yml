@@ -1,0 +1,67 @@
+# ============================================
+# 🔒 CLOUDFLARE TUNNEL CONFIGURATION
+# ============================================
+# Expose your local translation service to the internet securely
+# No port forwarding, no firewall changes needed
+# ============================================
+
+tunnel: live-translation
+credentials-file: /root/.cloudflared/credentials.json
+
+ingress:
+  # Frontend (React UI)
+  - hostname: translate.yourdomain.com
+    service: http://frontend:5173
+    originRequest:
+      noTLSVerify: true
+  
+  # WebSocket Backend
+  - hostname: ws.yourdomain.com
+    service: http://backend:8000
+    originRequest:
+      noTLSVerify: true
+      connectTimeout: 30s
+      keepAliveTimeout: 90s
+  
+  # ML Worker API (optional, for debugging)
+  - hostname: ml.yourdomain.com
+    service: http://ml-worker:9001
+    originRequest:
+      noTLSVerify: true
+      connectTimeout: 60s
+  
+  # Catch-all (404)
+  - service: http_status:404
+
+# ============================================
+# SETUP INSTRUCTIONS:
+# ============================================
+# 1. Install Cloudflare Tunnel:
+#    curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+#    chmod +x cloudflared
+#    sudo mv cloudflared /usr/local/bin/
+#
+# 2. Login and create tunnel:
+#    cloudflared tunnel login
+#    cloudflared tunnel create live-translation
+#
+# 3. Update DNS in Cloudflare dashboard:
+#    translate.yourdomain.com -> CNAME -> <tunnel-id>.cfargotunnel.com
+#    ws.yourdomain.com -> CNAME -> <tunnel-id>.cfargotunnel.com
+#    ml.yourdomain.com -> CNAME -> <tunnel-id>.cfargotunnel.com
+#
+# 4. Run tunnel:
+#    cloudflared tunnel --config cloudflared.yml run live-translation
+#
+# 5. Or add to docker-compose.yml:
+#    cloudflared:
+#      image: cloudflare/cloudflared:latest
+#      command: tunnel --config /etc/cloudflared/config.yml run
+#      volumes:
+#        - ./cloudflared.yml:/etc/cloudflared/config.yml:ro
+#        - ~/.cloudflared:/root/.cloudflared:ro
+#      depends_on:
+#        - frontend
+#        - backend
+#        - ml-worker
+# ============================================

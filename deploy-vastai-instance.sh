@@ -35,7 +35,9 @@ apt-get install -y \
     curl \
     git \
     htop \
-    nvtop
+    nvtop \
+    cmake \
+    build-essential
 
 # Set Python 3.11 as default
 update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 || true
@@ -102,8 +104,11 @@ fi
 # Create .env file
 cat > .env << EOF
 OPENAI_API_KEY=$OPENAI_API_KEY
-WHISPER_MODEL=large-v3
+WHISPER_MODEL=large-v3-turbo
 WHISPER_COMPUTE=float16
+NLLB_MODEL=facebook/nllb-200-3.3B
+NLLB_COMPUTE=bfloat16
+USE_BETTERTRANSFORMER=true
 BATCH_SIZE=8
 CUDA_DEVICE=0
 EOF
@@ -118,9 +123,9 @@ echo -e "${BLUE}📥 Pre-downloading models (this may take a few minutes)...${NC
 
 python3 -c "
 from faster_whisper import WhisperModel
-print('Downloading Whisper large-v3...')
-model = WhisperModel('large-v3', device='cuda', compute_type='float16')
-print('✓ Model downloaded and loaded on GPU')
+print('Downloading Whisper large-v3-turbo...')
+model = WhisperModel('large-v3-turbo', device='cuda', compute_type='float16')
+print('✓ Whisper model downloaded')
 "
 
 python3 -c "
@@ -128,6 +133,14 @@ from silero_vad import load_silero_vad
 print('Downloading Silero VAD...')
 load_silero_vad()
 print('✓ VAD model downloaded')
+"
+
+python3 -c "
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+print('Downloading NLLB-3.3B (Local Translation)...')
+AutoTokenizer.from_pretrained('facebook/nllb-200-3.3B')
+AutoModelForSeq2SeqLM.from_pretrained('facebook/nllb-200-3.3B')
+print('✓ NLLB model downloaded')
 "
 
 echo -e "${GREEN}✓ Models downloaded${NC}"
@@ -149,8 +162,11 @@ Type=simple
 User=root
 WorkingDirectory=/root/realtime-call-translate/ml-python
 Environment="OPENAI_API_KEY=$OPENAI_API_KEY"
-Environment="WHISPER_MODEL=large-v3"
+Environment="WHISPER_MODEL=large-v3-turbo"
 Environment="WHISPER_COMPUTE=float16"
+Environment="NLLB_MODEL=facebook/nllb-200-3.3B"
+Environment="NLLB_COMPUTE=bfloat16"
+Environment="USE_BETTERTRANSFORMER=true"
 Environment="BATCH_SIZE=8"
 ExecStart=/usr/bin/python3 -m uvicorn worker:app --host 0.0.0.0 --port 9001 --workers 1
 Restart=always

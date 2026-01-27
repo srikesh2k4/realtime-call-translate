@@ -1,22 +1,49 @@
+version: "3.9"
+
 services:
-  # ML Worker - Speech Recognition, Translation, TTS (NVIDIA GPU Optimized)
+  # ============================================
+  # ML Worker v3.0 - Hindi/English/Telugu
+  # RTX 5090 Optimized with LOCAL NLLB-3.3B Translation
+  # All 6 Translation Pairs Supported
+  # ============================================
   ml-worker:
     build:
       context: ./ml-python
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.gpu
     ports:
       - "9001:9001"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      # CUDA optimizations
+      # Optional: OpenAI API key for TTS only (translation is 100% LOCAL)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      
+      # === ASR Settings ===
+      - WHISPER_MODEL=large-v3-turbo
+      - WHISPER_COMPUTE=float16
+      
+      # === Translation Settings (NLLB-3.3B for HIGHEST ACCURACY) ===
+      - NLLB_MODEL=facebook/nllb-200-3.3B
+      - NLLB_COMPUTE=bfloat16
+      - USE_BETTERTRANSFORMER=true
+      - MAX_NEW_TOKENS=512
+      
+      # === Processing Settings ===
+      - BATCH_SIZE=8
+      - CUDA_DEVICE=0
+      - USE_LOCAL_TTS=false
+      
+      # === CUDA Optimizations for RTX 5090 ===
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      # Model settings (can override defaults)
-      - WHISPER_MODEL=large-v3
-      - WHISPER_COMPUTE=float16
-      - BATCH_SIZE=4
-      - CUDA_DEVICE=0
-    # 🚀 NVIDIA GPU Support - requires nvidia-container-toolkit
+      - TORCH_CUDA_ARCH_LIST=9.0;10.0
+      - CUDA_MODULE_LOADING=LAZY
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:1024,garbage_collection_threshold:0.9
+      - TOKENIZERS_PARALLELISM=false
+    volumes:
+      - ./ml-python/.env:/app/.env:ro
+      - huggingface_cache:/root/.cache/huggingface
+      - torch_cache:/root/.cache/torch
+    restart: unless-stopped
+    # RTX 5090 GPU allocation
     deploy:
       resources:
         reservations:
@@ -24,19 +51,18 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    volumes:
-      - ./ml-python/.env:/app/.env:ro
-      # Cache Hugging Face models to avoid re-downloading
-      - huggingface_cache:/root/.cache/huggingface
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
       interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s  # Models take time to load
+      timeout: 20s
+      retries: 5
+      start_period: 480s  # Increased for model download time
+    # Shared memory for PyTorch (16GB for NLLB-3.3B + Whisper)
+    shm_size: '16gb'
 
+  # ============================================
   # Go WebSocket Backend
+  # ============================================
   backend:
     build:
       context: ./backend-go
@@ -45,25 +71,32 @@ services:
       - "8000:8000"
     environment:
       - ML_WORKER_HOST=ml-worker
+      - ML_WORKER_PORT=9001
     depends_on:
-      - ml-worker
-    restart: unless-stopped
+      ml-worker:
+        condition: service_healthy
+    restart: always
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 10s
 
-  # Frontend - React/Vite
+  # ============================================
+  # Frontend - React + Vite
+  # ============================================
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
       - "5173:5173"
+    environment:
+      - VITE_WS_URL=ws://localhost:8000/ws
     depends_on:
       - backend
-    restart: unless-stopped
+    restart: always
 
 networks:
   default:
@@ -71,4 +104,6 @@ networks:
 
 volumes:
   huggingface_cache:
+    driver: local
+  torch_cache:
     driver: local

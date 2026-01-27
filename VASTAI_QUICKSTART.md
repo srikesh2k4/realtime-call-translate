@@ -30,21 +30,21 @@ python3 -m uvicorn worker:app --host 0.0.0.0 --port 9001
 ## Search Criteria for vast.ai
 
 ```
-GPU: RTX 4090
+GPU: RTX 4090 or RTX 3090 (Min 16GB VRAM)
 CUDA: >= 12.0
-Disk: >= 50 GB
+Disk: >= 60 GB
 Reliability: >= 95%
 Internet Down: >= 200 Mbps
 ```
 
 ## Required Ports
 
-| Port | Service |
-|------|---------|
-| 9001 | ML Worker API |
-| 8000 | Go Backend (optional) |
-| 5173 | Frontend (optional) |
-| 22 | SSH |
+| Port | Service | Notes |
+|------|---------|-------|
+| 9001 | ML Worker API | Pre-download 7GB model |
+| 8000 | Go Backend | WebSocket relay |
+| 5173 | Frontend | Web UI |
+| 22 | SSH | Remote access |
 
 ## Test Endpoints
 

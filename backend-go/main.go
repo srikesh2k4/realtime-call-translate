@@ -96,8 +96,8 @@ const (
 
 var (
 	upgrader = websocket.Upgrader{
-		ReadBufferSize:  16384,
-		WriteBufferSize: 16384,
+		ReadBufferSize:  65536,  // 64KB for better throughput
+		WriteBufferSize: 65536,  // 64KB for better throughput
 		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
 
@@ -108,9 +108,12 @@ var (
 	httpClient = &http.Client{
 		Timeout: ML_TIMEOUT,
 		Transport: &http.Transport{
-			MaxIdleConns:        100,
+			MaxIdleConns:        200,
 			MaxIdleConnsPerHost: 100,
+			MaxConnsPerHost:     100,
 			IdleConnTimeout:     90 * time.Second,
+			DisableKeepAlives:   false,
+			ForceAttemptHTTP2:   true,
 		},
 	}
 
@@ -142,6 +145,17 @@ func generateClientID() string {
 	return fmt.Sprintf("c%d", id)
 }
 
+// Supported languages - only en, hi, te allowed
+var supportedLanguages = map[string]bool{
+	"en": true, // English
+	"hi": true, // Hindi
+	"te": true, // Telugu
+}
+
+func isValidLanguage(lang string) bool {
+	return supportedLanguages[lang]
+}
+
 func getMLEndpoint() string {
 	// Check for Docker environment (ML_WORKER_HOST env var)
 	if host := os.Getenv("ML_WORKER_HOST"); host != "" {
@@ -149,6 +163,32 @@ func getMLEndpoint() string {
 	}
 	// Default to localhost for local development
 	return "http://127.0.0.1:9001"
+}
+
+// Retry ML request with exponential backoff
+func retryMLRequest(req *http.Request, maxRetries int) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+	
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 100ms, 200ms, 400ms
+			backoff := time.Duration(100 * (1 << (attempt - 1))) * time.Millisecond
+			time.Sleep(backoff)
+			log.Printf("🔄 Retry attempt %d/%d after %v", attempt, maxRetries, backoff)
+		}
+		
+		resp, err = httpClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
+		
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+	
+	return nil, fmt.Errorf("failed after %d retries: %w", maxRetries, err)
 }
 
 /* ================= WS HANDLER ================= */
@@ -344,6 +384,14 @@ func writePump(c *Client) {
 /* ================= ROOMS ================= */
 
 func joinRoom(c *Client, room, lang string) {
+	// Validate language - only en/hi/te allowed; if invalid, reject the join and close
+	if !isValidLanguage(lang) {
+		log.Printf("⚠️ [%s] Invalid language '%s', closing connection", c.id, lang)
+		_ = c.conn.WriteMessage(websocket.TextMessage, []byte(`{"error":"unsupported_language"}`))
+		_ = c.conn.Close()
+		return
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -453,15 +501,15 @@ func forward(sender *Client, pcm []float32) {
 	req.Header.Set("X-Speaker-Lang", sender.lang)
 	req.Header.Set("X-Speaker-Id", sender.id)
 
-	resp, err := httpClient.Do(req)
+	resp, err := retryMLRequest(req, 2)  // Retry up to 2 times
 	if err != nil {
-		log.Printf("ML request error: %v", err)
+		log.Printf("❌ ML request error after retries: %v", err)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("ML response status: %d", resp.StatusCode)
+		log.Printf("⚠️ ML response status: %d", resp.StatusCode)
 		return
 	}
 
