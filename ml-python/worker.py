@@ -592,9 +592,8 @@ def transcribe_audio(pcm: np.ndarray, language: str) -> Tuple[str, float]:
                 "min_silence_duration_ms": 100,
             },
             word_timestamps=False,
-            no_speech_threshold=0.6,  # Stricter: reject more ambiguous audio
-            compression_ratio_threshold=2.4,  # Anti-hallucination: reject highly compressed gibberish
-            logprob_threshold=-1.0,  # Anti-hallucination: reject low-probability outputs
+            no_speech_threshold=0.6,
+            compression_ratio_threshold=2.4,
         )
         
         full_text = ""
