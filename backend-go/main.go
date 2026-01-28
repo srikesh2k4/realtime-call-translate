@@ -157,16 +157,23 @@ func isValidLanguage(lang string) bool {
 }
 
 func getMLEndpoint() string {
-	// Check for Docker environment (ML_WORKER_HOST env var)
-	if host := os.Getenv("ML_WORKER_HOST"); host != "" {
-		return "http://" + host + ":9001"
+	// Check for Docker/deployment environment
+	host := os.Getenv("ML_WORKER_HOST")
+	port := os.Getenv("ML_WORKER_PORT")
+	
+	if host == "" {
+		host = "127.0.0.1"
 	}
-	// Default to localhost for local development
-	return "http://127.0.0.1:9001"
+	if port == "" {
+		port = "9001"
+	}
+	
+	return "http://" + host + ":" + port
 }
 
 // Retry ML request with exponential backoff
-func retryMLRequest(req *http.Request, maxRetries int) (*http.Response, error) {
+// Note: This creates a new request each retry since body can only be read once
+func retryMLRequest(endpoint string, audioData []byte, headers map[string]string, maxRetries int) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 	
@@ -178,7 +185,21 @@ func retryMLRequest(req *http.Request, maxRetries int) (*http.Response, error) {
 			log.Printf("🔄 Retry attempt %d/%d after %v", attempt, maxRetries, backoff)
 		}
 		
+		// Create fresh request each time (body can only be read once)
+		ctx, cancel := context.WithTimeout(context.Background(), ML_TIMEOUT)
+		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(audioData))
+		if reqErr != nil {
+			cancel()
+			return nil, reqErr
+		}
+		
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		
 		resp, err = httpClient.Do(req)
+		cancel()
+		
 		if err == nil && resp.StatusCode == http.StatusOK {
 			return resp, nil
 		}
@@ -481,27 +502,16 @@ func forward(sender *Client, pcm []float32) {
 	// Prepare audio buffer
 	buf := new(bytes.Buffer)
 	binary.Write(buf, binary.LittleEndian, pcm)
+	audioData := buf.Bytes()
 
-	ctx, cancel := context.WithTimeout(context.Background(), ML_TIMEOUT)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		getMLEndpoint()+"/process",
-		buf,
-	)
-	if err != nil {
-		log.Printf("Request creation error: %v", err)
-		return
+	headers := map[string]string{
+		"Content-Type":   "application/octet-stream",
+		"X-Room":         sender.room,
+		"X-Speaker-Lang": sender.lang,
+		"X-Speaker-Id":   sender.id,
 	}
 
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Room", sender.room)
-	req.Header.Set("X-Speaker-Lang", sender.lang)
-	req.Header.Set("X-Speaker-Id", sender.id)
-
-	resp, err := retryMLRequest(req, 2)  // Retry up to 2 times
+	resp, err := retryMLRequest(getMLEndpoint()+"/process", audioData, headers, 2)
 	if err != nil {
 		log.Printf("❌ ML request error after retries: %v", err)
 		return
@@ -570,9 +580,25 @@ func main() {
 	log.Println("🚀 Optimized Go WebSocket server starting on :8000")
 	log.Printf("📊 Config: MinSamples=%d, MaxSamples=%d, SilenceThreshold=%d",
 		MIN_SAMPLES, MAX_SAMPLES, SILENCE_THRESHOLD_SAMPLES)
+	log.Printf("🔗 ML Endpoint: %s", getMLEndpoint())
 
-	http.HandleFunc("/ws", wsHandler)
-	http.HandleFunc("/health", healthHandler)
+	// CORS middleware for Cloudflare compatibility
+	corsHandler := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "*")
+			
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			h(w, r)
+		}
+	}
+
+	http.HandleFunc("/ws", corsHandler(wsHandler))
+	http.HandleFunc("/health", corsHandler(healthHandler))
 
 	log.Fatal(http.ListenAndServe("0.0.0.0:8000", nil))
 }

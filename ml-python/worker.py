@@ -120,6 +120,16 @@ else:
 load_dotenv()
 app = FastAPI(title="Live Translation API v3.0 - Hindi/English/Telugu")
 
+# CORS middleware for Cloudflare tunnel compatibility
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ================= SUPPORTED LANGUAGES =================
 
 # NLLB Language codes for our 3 languages
