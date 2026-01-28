@@ -15,12 +15,15 @@ type WSMessage = {
 };
 
 const LANGUAGES: Record<Language, { name: string; flag: string; script: string }> = {
-  en: { name: "English", flag: "��", script: "Latin" },
+  en: { name: "English", flag: "🇬🇧", script: "Latin" },
   hi: { name: "Hindi", flag: "🇮🇳", script: "हिन्दी" },
   te: { name: "Telugu", flag: "🇮🇳", script: "తెలుగు" },
 };
 
-const WS_URL = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+// Support custom WebSocket URL via environment variable (for Cloudflare tunnel)
+// Example: VITE_WS_URL=wss://xxx.trycloudflare.com/ws
+const WS_URL = import.meta.env.VITE_WS_URL ||
+  `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
 const SAMPLE_RATE = 16000;
 const CHUNK_SIZE = 3200; // ~200ms chunks
 const MAX_AUDIO_QUEUE = 10; // Prevent queue overflow
