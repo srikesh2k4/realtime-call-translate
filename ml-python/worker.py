@@ -58,6 +58,27 @@ from dotenv import load_dotenv
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# ================= FIX CUDA LIBRARY PATH =================
+# This fixes "libcublas.so.12 not found" error on vast.ai
+import glob
+cuda_lib_paths = [
+    "/usr/local/cuda/lib64",
+    "/usr/local/cuda-12/lib64",
+    "/usr/lib/x86_64-linux-gnu",
+    "/opt/cuda/lib64",
+]
+# Find nvidia cublas from pip packages
+pip_nvidia_paths = glob.glob("/venv/*/lib/python*/site-packages/nvidia/*/lib")
+pip_nvidia_paths += glob.glob("/usr/local/lib/python*/dist-packages/nvidia/*/lib")
+pip_nvidia_paths += glob.glob(os.path.expanduser("~/.local/lib/python*/site-packages/nvidia/*/lib"))
+cuda_lib_paths.extend(pip_nvidia_paths)
+
+existing_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+new_paths = [p for p in cuda_lib_paths if os.path.exists(p) and p not in existing_ld_path]
+if new_paths:
+    os.environ["LD_LIBRARY_PATH"] = ":".join(new_paths) + ":" + existing_ld_path
+    print(f"🔧 Added CUDA lib paths: {new_paths[:3]}...")
+
 # ================= CRASH-PROOF ERROR HANDLER =================
 
 def safe_execute(func, *args, default=None, error_msg="Error", **kwargs):
