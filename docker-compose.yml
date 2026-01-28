@@ -59,6 +59,13 @@ services:
       start_period: 480s  # Increased for model download time
     # Shared memory for PyTorch (16GB for NLLB-3.3B + Whisper)
     shm_size: '16gb'
+    # For docker-compose on modern Docker, request GPU device access explicitly so the
+    # container can see host CUDA libraries (requires nvidia-container-toolkit/runtime).
+    # This ensures libcublas and other libs are mounted into the container at runtime.
+    device_requests:
+      - driver: nvidia
+        count: 1
+        capabilities: [gpu]
 
   # ============================================
   # Go WebSocket Backend

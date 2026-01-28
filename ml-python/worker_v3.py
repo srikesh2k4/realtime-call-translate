@@ -89,6 +89,26 @@ print("\n🔧 Initializing CUDA for RTX 5090...")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
+# Verify CUDA *runtime* works (libcublas, drivers). Sometimes torch.cuda.is_available()
+# returns True but loading CUDA libs (libcublas.so) fails at runtime because the
+# container/host drivers or nvidia-container-toolkit are not configured. In that case
+# fall back to CPU to keep the worker healthy (slower but functional).
+cuda_runtime_ok = False
+if DEVICE == "cuda":
+    try:
+        # Try a tiny CUDA operation to force-load CUDA runtime libraries.
+        torch.cuda.current_device()
+        _ = torch.tensor([1.0], device="cuda")
+        cuda_runtime_ok = True
+    except Exception as e:
+        print(f"   ⚠️ CUDA runtime check failed: {e}")
+        cuda_runtime_ok = False
+
+if not cuda_runtime_ok:
+    print("   ⚠️ CUDA runtime is not usable (missing libs or drivers). Falling back to CPU.")
+    DEVICE = "cpu"
+    DTYPE = torch.float32
+
 if DEVICE == "cuda":
     try:
         # RTX 5090 Blackwell optimizations
