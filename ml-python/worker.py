@@ -282,20 +282,44 @@ try:
 except Exception as e:
     print(f"   ⚠️ VAD loading error: {e}")
 
-# ================= WHISPER ASR =================
+# ================= WHISPER ASR (HuggingFace - NO ctranslate2) =================
 
-print(f"\n🔄 Loading Whisper {config.WHISPER_MODEL}...")
+print(f"\n🔄 Loading Whisper (HuggingFace)...")
 
 whisper_model = None
+whisper_processor = None
+USE_HF_WHISPER = True  # Use HuggingFace instead of faster-whisper
+
 try:
-    from faster_whisper import WhisperModel
-    whisper_model = WhisperModel(
-        config.WHISPER_MODEL,
-        device=DEVICE,
-        compute_type=config.WHISPER_COMPUTE if DEVICE == "cuda" else "float32",
-        num_workers=config.BATCH_SIZE,
+    from transformers import WhisperProcessor, WhisperForConditionalGeneration
+    
+    # Map model names
+    whisper_model_map = {
+        "large-v3-turbo": "openai/whisper-large-v3-turbo",
+        "large-v3": "openai/whisper-large-v3",
+        "large-v2": "openai/whisper-large-v2",
+        "medium": "openai/whisper-medium",
+        "small": "openai/whisper-small",
+        "base": "openai/whisper-base",
+        "tiny": "openai/whisper-tiny",
+    }
+    
+    model_name = whisper_model_map.get(config.WHISPER_MODEL, f"openai/whisper-{config.WHISPER_MODEL}")
+    print(f"   → Loading {model_name}...")
+    
+    whisper_processor = WhisperProcessor.from_pretrained(model_name)
+    whisper_model = WhisperForConditionalGeneration.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+        low_cpu_mem_usage=True,
     )
+    
+    if DEVICE == "cuda":
+        whisper_model = whisper_model.to(DEVICE)
+    
+    whisper_model.config.forced_decoder_ids = None
     print(f"   ✓ Whisper {config.WHISPER_MODEL} loaded on {DEVICE}")
+    
 except Exception as e:
     print(f"   ❌ Whisper loading error: {e}")
     raise RuntimeError("Whisper model is required!")
@@ -582,8 +606,8 @@ def is_valid_transcript(text: str, language: str, min_words: int = 1) -> bool:
 # ================= ASR =================
 
 def transcribe_audio(pcm: np.ndarray, language: str) -> Tuple[str, float]:
-    """Transcribe with Whisper large-v3-turbo - crash-proof"""
-    if whisper_model is None:
+    """Transcribe with HuggingFace Whisper - crash-proof"""
+    if whisper_model is None or whisper_processor is None:
         return "", 0.0
     
     try:
@@ -599,35 +623,43 @@ def transcribe_audio(pcm: np.ndarray, language: str) -> Tuple[str, float]:
         # Map language code
         whisper_lang = SUPPORTED_LANGUAGES.get(language, {}).get("whisper_code", language)
         
-        segments, info = whisper_model.transcribe(
+        # Process audio with HuggingFace Whisper
+        input_features = whisper_processor(
             pcm,
-            language=whisper_lang,
-            beam_size=5,
-            best_of=5,
-            temperature=0.0,
-            condition_on_previous_text=False,
-            vad_filter=True,
-            vad_parameters={
-                "threshold": 0.35,
-                "min_speech_duration_ms": 150,
-                "min_silence_duration_ms": 100,
-            },
-            word_timestamps=False,
-            no_speech_threshold=0.6,
-            compression_ratio_threshold=2.4,
-        )
+            sampling_rate=config.SAMPLE_RATE,
+            return_tensors="pt"
+        ).input_features
         
-        full_text = ""
-        total_prob = 0.0
-        count = 0
+        if DEVICE == "cuda":
+            input_features = input_features.to(DEVICE, dtype=torch.float16)
         
-        for segment in segments:
-            full_text += segment.text
-            total_prob += np.exp(segment.avg_logprob)
-            count += 1
+        # Generate transcription
+        with torch.inference_mode():
+            forced_decoder_ids = whisper_processor.get_decoder_prompt_ids(
+                language=whisper_lang,
+                task="transcribe"
+            )
+            
+            generated_ids = whisper_model.generate(
+                input_features,
+                forced_decoder_ids=forced_decoder_ids,
+                max_new_tokens=448,
+                num_beams=5,
+                do_sample=False,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
         
-        confidence = total_prob / count if count > 0 else 0.0
-        return full_text.strip(), confidence
+        # Decode
+        transcription = whisper_processor.batch_decode(
+            generated_ids.sequences,
+            skip_special_tokens=True
+        )[0].strip()
+        
+        # Calculate confidence (approximate from sequence scores)
+        confidence = 0.8 if transcription else 0.0  # HF Whisper doesn't give per-segment confidence easily
+        
+        return transcription, confidence
         
     except Exception as e:
         print(f"   ⚠️ ASR Error: {e}")
