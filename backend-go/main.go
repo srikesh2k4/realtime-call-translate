@@ -546,9 +546,18 @@ func forward(sender *Client, pcm []float32) {
 	defer mu.RUnlock()
 
 	for _, res := range results {
+		// Always send back to sender (for single-user demo)
+		b, _ := json.Marshal(res)
+		select {
+		case sender.send <- b:
+			log.Printf("📤 [%s] Sent to sender: %s→%s", sender.id, res.SourceLang, res.TargetLang)
+		default:
+			log.Printf("⚠️ [%s] Sender buffer full", sender.id)
+		}
+
+		// Also send to other peers with matching target language
 		for peer := range rooms[sender.room] {
 			if peer.lang == res.TargetLang && peer != sender {
-				b, _ := json.Marshal(res)
 				select {
 				case peer.send <- b:
 				default:
