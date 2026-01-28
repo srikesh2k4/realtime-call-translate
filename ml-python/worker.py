@@ -424,13 +424,20 @@ if not USE_OPENAI_TTS and not USE_LOCAL_TTS_LOADED:
 if DEVICE == "cuda":
     print("\n🔥 Warming up models for maximum speed...")
     
-    # Warmup Whisper
+    # Warmup HuggingFace Whisper
     dummy_audio = np.random.randn(config.SAMPLE_RATE).astype(np.float32) * 0.01
     for lang in ["en", "hi", "te"]:
         try:
-            list(whisper_model.transcribe(dummy_audio, language=lang))
-        except:
-            pass
+            input_features = whisper_processor(
+                dummy_audio,
+                sampling_rate=config.SAMPLE_RATE,
+                return_tensors="pt"
+            ).input_features.to(DEVICE, dtype=torch.float16)
+            
+            with torch.inference_mode():
+                whisper_model.generate(input_features, max_new_tokens=10)
+        except Exception as e:
+            print(f"   ⚠️ Whisper warmup {lang}: {e}")
     print("   ✓ Whisper warmed up (en, hi, te)")
     
     # Warmup NLLB for all translation pairs
