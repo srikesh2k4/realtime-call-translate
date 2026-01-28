@@ -191,15 +191,15 @@ print(f"🔄 Translation Pairs: {len(TRANSLATION_PAIRS)} combinations")
 class Config:
     SAMPLE_RATE: int = 16000
     
-    # Speech detection - optimized for long sentences
-    MIN_SPEECH_MS: int = 200
+    # Speech detection - more responsive
+    MIN_SPEECH_MS: int = 150  # Lower for faster response
     MAX_SPEECH_MS: int = 45000  # 45 seconds for very long sentences
-    SILENCE_THRESHOLD_MS: int = 600  # Wait longer before processing
+    SILENCE_THRESHOLD_MS: int = 400  # 400ms silence = end of utterance
     
     # VAD - tuned for accuracy
-    VAD_THRESHOLD: float = 0.35
-    VAD_MIN_SPEECH_MS: int = 150
-    VAD_MIN_SILENCE_MS: int = 100
+    VAD_THRESHOLD: float = 0.3  # Lower for better detection
+    VAD_MIN_SPEECH_MS: int = 100
+    VAD_MIN_SILENCE_MS: int = 80
     
     # Noise reduction
     NOISE_REDUCE: bool = True
@@ -219,9 +219,12 @@ class Config:
     BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "4"))
     MAX_NEW_TOKENS: int = int(os.getenv("MAX_NEW_TOKENS", "512"))  # Long output support
     
-    # Quality thresholds
-    RMS_THRESHOLD: float = 0.002
-    MIN_CONFIDENCE: float = 0.20
+    # Quality thresholds - lowered for better detection
+    RMS_THRESHOLD: float = 0.001  # Very low for quiet audio
+    MIN_CONFIDENCE: float = 0.15  # Accept lower confidence
+    
+    # Debug mode
+    DEBUG: bool = os.getenv("DEBUG", "true").lower() == "true"
     
 config = Config()
 
@@ -1022,10 +1025,14 @@ async def process(req: Request):
         speaker_id = req.headers.get("X-Speaker-Id", "default")
         
         if not room or not speaker_lang:
+            if config.DEBUG:
+                print(f"   ⚠️ Missing headers: room={room}, lang={speaker_lang}")
             return JSONResponse(content=[], status_code=200)
 
         # Strict language validation to avoid hallucinations / misroutes
         if speaker_lang not in SUPPORTED_LANGUAGES:
+            if config.DEBUG:
+                print(f"   ⚠️ Unsupported language: {speaker_lang}")
             return JSONResponse(content=[], status_code=200)
         
         raw = await req.body()
@@ -1036,10 +1043,22 @@ async def process(req: Request):
         if pcm.size == 0:
             return JSONResponse(content=[], status_code=200)
         
-        return await process_audio_chunk(room, speaker_id, speaker_lang, pcm)
+        # Debug: log audio stats
+        if config.DEBUG:
+            rms = rms_energy(pcm)
+            duration_ms = len(pcm) / config.SAMPLE_RATE * 1000
+            print(f"📥 Audio: {duration_ms:.0f}ms, RMS={rms:.4f}, lang={speaker_lang}")
+        
+        results = await process_audio_chunk(room, speaker_id, speaker_lang, pcm)
+        
+        if results and config.DEBUG:
+            print(f"✅ Returning {len(results)} translation(s)")
+        
+        return JSONResponse(content=results, status_code=200)
     
     except Exception as e:
         print(f"   ❌ API Error: {e}")
+        traceback.print_exc()
         return JSONResponse(content=[], status_code=200)
 
 @app.get("/health")
