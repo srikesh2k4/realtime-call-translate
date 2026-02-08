@@ -26,11 +26,6 @@ export default defineConfig({
     },
   },
 
-  // Prevent Vite from optimizing WebSocket / ffmpeg deps incorrectly
-  optimizeDeps: {
-    exclude: ["@ffmpeg/ffmpeg"],
-  },
-
   build: {
     target: "esnext",
   },

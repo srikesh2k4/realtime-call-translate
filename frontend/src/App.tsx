@@ -7,9 +7,11 @@ type Language = "en" | "hi";
 
 type WSMessage = {
   type?: "final";
-  text?: string;
-  translated?: string;
+  sourceText?: string;
+  translatedText?: string;
   audio?: string;
+  sourceLang?: string;
+  targetLang?: string;
 };
 
 /* ================= CONFIG ================= */
@@ -128,14 +130,74 @@ export default function App() {
     ws.onopen = async () => {
       ws.send(JSON.stringify({ room, lang }));
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      /* ---- get mic with browser noise suppression ---- */
+      if (!navigator.mediaDevices?.getUserMedia) {
+        alert(
+          "Microphone access requires HTTPS or localhost. " +
+          "Please open http://localhost:5173 instead."
+        );
+        ws.close();
+        return;
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true,
+          // Narrow bandwidth captures voice only (300-3400 Hz typical)
+          sampleRate: 16000,
+          channelCount: 1,
+        },
+      });
       const ctx = audioCtxRef.current!;
+
+      /* ---- Web Audio filter chain for voice isolation ---- */
+
+      // High-pass filter: removes low-frequency rumble / hum (< 85 Hz)
+      const highPass = ctx.createBiquadFilter();
+      highPass.type = "highpass";
+      highPass.frequency.value = 85;
+      highPass.Q.value = 0.7;
+
+      // Second high-pass at 120 Hz for steeper roll-off
+      const highPass2 = ctx.createBiquadFilter();
+      highPass2.type = "highpass";
+      highPass2.frequency.value = 120;
+      highPass2.Q.value = 0.5;
+
+      // Low-pass filter: removes high-frequency hiss / noise (> 3500 Hz)
+      const lowPass = ctx.createBiquadFilter();
+      lowPass.type = "lowpass";
+      lowPass.frequency.value = 3500;
+      lowPass.Q.value = 0.7;
+
+      // Peaking filter: boost the 1-3 kHz speech presence range
+      const presence = ctx.createBiquadFilter();
+      presence.type = "peaking";
+      presence.frequency.value = 2000;
+      presence.Q.value = 1.0;
+      presence.gain.value = 3; // +3 dB boost for speech clarity
+
+      // Compressor: even out loud/soft speech & squash transient noise
+      const compressor = ctx.createDynamicsCompressor();
+      compressor.threshold.value = -30;  // dB threshold
+      compressor.knee.value = 10;
+      compressor.ratio.value = 4;        // 4:1 compression
+      compressor.attack.value = 0.003;   // fast attack for noise
+      compressor.release.value = 0.15;   // smooth release
 
       analyserRef.current = ctx.createAnalyser();
       analyserRef.current.fftSize = 256;
 
       const mic = ctx.createMediaStreamSource(stream);
-      mic.connect(analyserRef.current);
+
+      // Chain: mic → highPass → highPass2 → lowPass → presence → compressor → analyser
+      mic.connect(highPass);
+      highPass.connect(highPass2);
+      highPass2.connect(lowPass);
+      lowPass.connect(presence);
+      presence.connect(compressor);
+      compressor.connect(analyserRef.current);
 
       /* ---- mic level animation ---- */
       const data = new Uint8Array(analyserRef.current.frequencyBinCount);
@@ -152,7 +214,7 @@ export default function App() {
 
       let buffers: Float32Array[] = [];
       let size = 0;
-      const TARGET = 5120;
+      const TARGET = 2560; // ~160ms chunks — faster streaming to backend
 
       worklet.port.onmessage = e => {
         if (!(e.data instanceof Float32Array)) return;
@@ -174,7 +236,8 @@ export default function App() {
         }
       };
 
-      mic.connect(worklet);
+      // Connect filtered audio to worklet (after the full filter chain)
+      compressor.connect(worklet);
       setInCall(true);
     };
 
@@ -201,8 +264,8 @@ export default function App() {
       if (msg.type !== "final") return;
 
       setStatus("processing");
-      if (msg.text) setRecognized(msg.text);
-      if (msg.translated) setTranslated(msg.translated);
+      if (msg.sourceText) setRecognized(msg.sourceText);
+      if (msg.translatedText) setTranslated(msg.translatedText);
       if (msg.audio) enqueueAudio(msg.audio);
     };
 

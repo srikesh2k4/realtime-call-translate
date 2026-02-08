@@ -2,11 +2,7 @@ fastapi
 uvicorn
 numpy
 soundfile
-webrtcvad
 torch
-faster-whisper
-transformers==4.41.2
-sentencepiece
-protobuf
+silero-vad
 python-dotenv
 openai

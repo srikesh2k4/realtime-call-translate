@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -42,15 +43,37 @@ type MLResponse struct {
 /* ================= AUDIO ================= */
 
 type AudioState struct {
-	samples []float32
+	samples       []float32
+	silenceFrames int       // consecutive low-energy frames
+	lastSendTime  time.Time // when we last dispatched to ML
 }
 
 /* ================= GLOBALS ================= */
 
+const (
+	SAMPLE_RATE = 16000
+
+	// Minimum audio before we'll even consider sending (1.5s — fast response)
+	MIN_SAMPLES = SAMPLE_RATE * 3 / 2
+
+	// Maximum audio buffer before forced send (6s — keeps utterances short)
+	MAX_SAMPLES = SAMPLE_RATE * 6
+
+	// How much silence (in frames) triggers end-of-utterance flush
+	// Each frame from the frontend ≈ 2560 samples = 160ms
+	SILENCE_FRAMES_THRESHOLD = 3 // ~0.5s of silence → sentence boundary
+
+	// RMS threshold for "silence" detection
+	SILENCE_RMS = float64(0.008)
+
+	// Max time before forced flush even if still speaking (8s)
+	MAX_BUFFER_DURATION = 8 * time.Second
+)
+
 var (
 	upgrader = websocket.Upgrader{
-		ReadBufferSize:  8192,
-		WriteBufferSize: 8192,
+		ReadBufferSize:  16384,
+		WriteBufferSize: 16384,
 		CheckOrigin:     func(r *http.Request) bool { return true },
 	}
 
@@ -58,10 +81,7 @@ var (
 	audioBuffers = map[*Client]*AudioState{}
 	mu           sync.RWMutex
 
-	httpClient = &http.Client{Timeout: 120 * time.Second}
-
-	// MUST MATCH BACKEND (2.5s @ 16k)
-	WINDOW_SAMPLES = 16000 * 25 / 10
+	httpClient = &http.Client{Timeout: 45 * time.Second}
 )
 
 /* ================= WS HANDLER ================= */
@@ -78,7 +98,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	audioBuffers[client] = &AudioState{}
+	audioBuffers[client] = &AudioState{lastSendTime: time.Now()}
 	mu.Unlock()
 
 	go writePump(client)
@@ -122,21 +142,60 @@ func handleAudio(c *Client, data []byte) {
 		return
 	}
 
+	// Compute RMS energy of this incoming chunk
+	var sumSq float64
+	for _, s := range samples {
+		sumSq += float64(s) * float64(s)
+	}
+	rms := math.Sqrt(sumSq / float64(len(samples)))
+
 	mu.Lock()
 	state := audioBuffers[c]
 	state.samples = append(state.samples, samples...)
 
-	if len(state.samples) < WINDOW_SAMPLES || atomic.LoadInt32(&c.mlBusy) == 1 {
+	totalSamples := len(state.samples)
+	isSilent := rms < SILENCE_RMS
+
+	if isSilent {
+		state.silenceFrames++
+	} else {
+		state.silenceFrames = 0
+	}
+
+	// Decide whether to flush the buffer to ML:
+	// 1. Enough audio + silence detected (sentence boundary)
+	// 2. Buffer hit max size (forced flush)
+	// 3. Timeout since last send (forced flush)
+	shouldFlush := false
+	reason := ""
+
+	if totalSamples >= MIN_SAMPLES && state.silenceFrames >= SILENCE_FRAMES_THRESHOLD {
+		shouldFlush = true
+		reason = "silence-boundary"
+	} else if totalSamples >= MAX_SAMPLES {
+		shouldFlush = true
+		reason = "max-buffer"
+	} else if totalSamples >= MIN_SAMPLES && !state.lastSendTime.IsZero() &&
+		time.Since(state.lastSendTime) > MAX_BUFFER_DURATION {
+		shouldFlush = true
+		reason = "timeout"
+	}
+
+	if !shouldFlush || atomic.LoadInt32(&c.mlBusy) == 1 {
 		mu.Unlock()
 		return
 	}
 
-	audio := make([]float32, WINDOW_SAMPLES)
-	copy(audio, state.samples[:WINDOW_SAMPLES])
-	state.samples = state.samples[WINDOW_SAMPLES:]
+	// Take all buffered audio
+	audio := make([]float32, totalSamples)
+	copy(audio, state.samples)
+	state.samples = state.samples[:0]
+	state.silenceFrames = 0
+	state.lastSendTime = time.Now()
 	atomic.StoreInt32(&c.mlBusy, 1)
 	mu.Unlock()
 
+	log.Printf("Flushing %d samples (%.1fs) reason=%s", len(audio), float64(len(audio))/float64(SAMPLE_RATE), reason)
 	go forward(c, audio)
 }
 
@@ -221,7 +280,7 @@ func forward(sender *Client, pcm []float32) {
 	buf := new(bytes.Buffer)
 	_ = binary.Write(buf, binary.LittleEndian, pcm)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	req, _ := http.NewRequestWithContext(
