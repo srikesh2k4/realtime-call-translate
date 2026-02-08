@@ -201,9 +201,9 @@ export default function App() {
       if (msg.type !== "final") return;
 
       setStatus("processing");
-      msg.text && setRecognized(msg.text);
-      msg.translated && setTranslated(msg.translated);
-      msg.audio && enqueueAudio(msg.audio);
+      if (msg.text) setRecognized(msg.text);
+      if (msg.translated) setTranslated(msg.translated);
+      if (msg.audio) enqueueAudio(msg.audio);
     };
 
     ws.onerror = stopCall;
@@ -324,7 +324,7 @@ const btn = (active: boolean) => ({
   color: "white",
 });
 
-const styles: any = {
+const styles: Record<string, React.CSSProperties> = {
   page: {
     minHeight: "100vh",
     background: "#020617",
