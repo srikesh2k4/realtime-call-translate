@@ -53,16 +53,6 @@ def rms_energy(pcm: np.ndarray) -> float:
     return float(np.sqrt(np.mean(pcm * pcm)))
 
 
-def light_bandpass(pcm: np.ndarray) -> np.ndarray:
-    """Lightweight FFT bandpass — only cuts sub-80Hz rumble and >4kHz hiss.
-    The frontend already does heavy filtering, so this is minimal."""
-    fft = np.fft.rfft(pcm)
-    freqs = np.fft.rfftfreq(len(pcm), d=1.0 / SAMPLE_RATE)
-    fft[freqs < 80] = 0
-    fft[freqs > 4000] = 0
-    return np.fft.irfft(fft, n=len(pcm)).astype(np.float32)
-
-
 def extract_speech_segments(pcm: np.ndarray) -> tuple[np.ndarray, bool]:
     """Use Silero VAD to extract only speech segments from the audio.
     Returns (speech_pcm, has_speech) — combines the old has_real_speech
@@ -79,18 +69,18 @@ def extract_speech_segments(pcm: np.ndarray) -> tuple[np.ndarray, bool]:
             audio,
             vad_model,
             sampling_rate=SAMPLE_RATE,
-            threshold=0.5,               # stricter voice confidence (was 0.45)
-            min_speech_duration_ms=300,   # min 300ms speech segment (was 200ms)
-            min_silence_duration_ms=400,  # need 400ms silence to split (was 300ms)
-            speech_pad_ms=200,            # pad speech segments (was 150ms)
+            threshold=0.4,               # balanced voice confidence
+            min_speech_duration_ms=200,   # min 200ms speech segment
+            min_silence_duration_ms=300,  # 300ms silence to split
+            speech_pad_ms=150,            # pad speech segments
         )
 
     if not timestamps:
         return np.array([], dtype=np.float32), False
 
-    # Check voiced ratio — need at least 15% of audio to be speech
+    # Check voiced ratio — need at least 10% of audio to be speech
     voiced = sum(t["end"] - t["start"] for t in timestamps)
-    if (voiced / len(pcm)) < 0.15:
+    if (voiced / len(pcm)) < 0.10:
         return np.array([], dtype=np.float32), False
 
     # Concatenate speech segments
@@ -276,13 +266,16 @@ def tts(text: str, lang: str) -> str:
 
 def translate_and_tts(text: str, src: str, tgt: str) -> dict | None:
     """Run translation then TTS for a single target language.
-    Called in parallel for each target language."""
+    Translation and TTS are called sequentially per-language but
+    multiple languages run in parallel via the thread pool."""
+    t_start = time.perf_counter()
     translated = translate(text, src, tgt)
 
     if translated.strip().lower() == text.lower() and len(text) > 10:
         return None
 
     audio_b64 = tts(translated, tgt)
+    print(f"[ML] translate+TTS for {tgt} took {time.perf_counter()-t_start:.2f}s")
 
     return {
         "type": "final",
@@ -315,29 +308,25 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
     print(f"[ML] Processing {duration:.1f}s audio from room={room} lang={speaker_lang}")
 
     # 1. Quick energy gate (skip silence immediately)
-    if rms_energy(pcm) < 0.005:
-        print("[ML] Rejected: too quiet (RMS < 0.005)")
+    if rms_energy(pcm) < 0.003:
+        print("[ML] Rejected: too quiet")
         return []
 
-    # 2. Lightweight bandpass (frontend already does heavy filtering)
-    pcm = light_bandpass(pcm)
-
-    # 3. Single VAD pass — extracts speech segments AND checks validity
+    # 2. Single VAD pass — extracts speech segments AND checks validity
     speech_pcm, has_speech = extract_speech_segments(pcm)
-    if not has_speech or len(speech_pcm) < SAMPLE_RATE * 0.5:
+    if not has_speech or len(speech_pcm) < SAMPLE_RATE * 0.3:
         print("[ML] Rejected: no real speech detected or too short")
         return []
 
-    # Reject if speech is too short after VAD (< 0.8s of actual speech → hallucination risk)
+    # Reject if speech is too short after VAD (< 0.4s of actual speech → hallucination risk)
     speech_duration = len(speech_pcm) / SAMPLE_RATE
-    if speech_duration < 0.8:
+    if speech_duration < 0.4:
         print(f"[ML] Rejected: speech too short after VAD ({speech_duration:.2f}s)")
         return []
 
     wav = pcm_to_wav(speech_pcm)
 
-    # 4. ASR — NO context prompt. Previous transcripts as prompt cause Whisper
-    #    to hallucinate/repeat old sentences, especially across languages.
+    # 3. ASR — NO context prompt to avoid hallucination/repetition
     t_asr = time.perf_counter()
     asr_kwargs = {
         "file": ("audio.wav", wav),
@@ -350,15 +339,15 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
     text = tr.text.strip()
     print(f"[ML] ASR took {time.perf_counter() - t_asr:.2f}s → '{text}'")
 
-    # 5. Text sanity gate
+    # 4. Text sanity gate
     if not is_valid_transcript(text, room=room):
         print(f"[ML] Rejected transcript: '{text}'")
         return []
 
-    # 6. Update dedup tracking (context no longer used for prompts but kept for dedup)
+    # 5. Update dedup tracking
     room_last_transcript[room] = text
 
-    # 7. Translate + TTS in PARALLEL for each target language
+    # 6. Translate + TTS in PARALLEL for each target language
     t_mt = time.perf_counter()
     target_langs = [lang for lang in ("en", "hi") if lang != speaker_lang]
 

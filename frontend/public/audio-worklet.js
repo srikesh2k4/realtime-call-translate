@@ -14,7 +14,7 @@ class PCMProcessor extends AudioWorkletProcessor {
     this.noiseFloor = 0.005;       // initial noise estimate
     this.NOISE_ADAPT_UP = 0.0002;  // how fast noise floor rises (slow)
     this.NOISE_ADAPT_DOWN = 0.001; // how fast it drops when silence detected
-    this.GATE_RATIO = 3.0;         // signal must be 3× above noise floor
+    this.GATE_RATIO = 2.5;         // signal must be 2.5× above noise floor (was 3.0)
 
     // ===== Smooth Gain Envelope =====
     // Prevents harsh on/off clicks by ramping gain up/down.
@@ -26,7 +26,7 @@ class PCMProcessor extends AudioWorkletProcessor {
     // We compute RMS and zero-crossing rate per frame.
     // Voice has moderate ZCR and higher RMS.
     this.silenceFrames = 0;         // consecutive silent frames
-    this.MAX_SILENCE_FRAMES = 12;   // ~96ms at 128-sample frames @ 16kHz
+    this.MAX_SILENCE_FRAMES = 20;   // ~160ms at 128-sample frames @ 16kHz — keep sending through short pauses
     this.isVoiceActive = false;
 
     // ===== Output gain =====
@@ -130,8 +130,8 @@ class PCMProcessor extends AudioWorkletProcessor {
     // Sending during envelope release causes silence-heavy chunks → hallucination
     if (this.isVoiceActive) {
       this.port.postMessage(output);
-    } else if (this.envelope > 0.1) {
-      // Small release tail (only above 10% gain) to avoid clipping the end of words
+    } else if (this.envelope > 0.02) {
+      // Release tail down to 2% — captures word endings without sending pure silence
       this.port.postMessage(output);
     }
     // Below 10% envelope → don't send (prevents silence-heavy audio reaching ML)

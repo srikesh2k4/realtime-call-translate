@@ -10,7 +10,6 @@ import (
 	"math"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -19,11 +18,10 @@ import (
 /* ================= TYPES ================= */
 
 type Client struct {
-	conn   *websocket.Conn
-	room   string
-	lang   string
-	send   chan []byte
-	mlBusy int32
+	conn *websocket.Conn
+	room string
+	lang string
+	send chan []byte
 }
 
 type JoinMessage struct {
@@ -53,26 +51,25 @@ type AudioState struct {
 const (
 	SAMPLE_RATE = 16000
 
-	// Minimum audio before we'll even consider sending (2s — avoids short hallucination-prone clips)
-	MIN_SAMPLES = SAMPLE_RATE * 2
+	// Minimum audio before we'll consider sending (1s — responsive)
+	MIN_SAMPLES = SAMPLE_RATE * 1
 
-	// Maximum audio buffer before forced send (8s — keeps utterances manageable)
-	MAX_SAMPLES = SAMPLE_RATE * 8
+	// Maximum audio buffer before forced send (6s)
+	MAX_SAMPLES = SAMPLE_RATE * 6
 
 	// How much silence (in frames) triggers end-of-utterance flush
-	// Each frame from the frontend ≈ 6400 samples = 400ms
-	// 4 frames ≈ 1.6s of silence → confident sentence boundary
-	SILENCE_FRAMES_THRESHOLD = 4
+	// Each frame from the frontend ≈ 3200 samples = 200ms
+	// 3 frames ≈ 0.6s of silence → sentence boundary
+	SILENCE_FRAMES_THRESHOLD = 3
 
 	// RMS threshold for "silence" detection
-	SILENCE_RMS = float64(0.008)
+	SILENCE_RMS = float64(0.006)
 
 	// Minimum RMS energy for the entire buffer to be worth sending
-	// Prevents sending buffers that are mostly silence with a tiny bit of speech
-	MIN_BUFFER_RMS = float64(0.005)
+	MIN_BUFFER_RMS = float64(0.004)
 
-	// Max time before forced flush even if still speaking (10s)
-	MAX_BUFFER_DURATION = 10 * time.Second
+	// Max time before forced flush even if still speaking (6s)
+	MAX_BUFFER_DURATION = 6 * time.Second
 )
 
 var (
@@ -186,7 +183,7 @@ func handleAudio(c *Client, data []byte) {
 		reason = "timeout"
 	}
 
-	if !shouldFlush || atomic.LoadInt32(&c.mlBusy) == 1 {
+	if !shouldFlush {
 		mu.Unlock()
 		return
 	}
@@ -233,7 +230,6 @@ func handleAudio(c *Client, data []byte) {
 		audio = audio[:trimIdx]
 	}
 
-	atomic.StoreInt32(&c.mlBusy, 1)
 	mu.Unlock()
 
 	log.Printf("Flushing %d samples (%.1fs) reason=%s", len(audio), float64(len(audio))/float64(SAMPLE_RATE), reason)
@@ -286,7 +282,6 @@ func cleanup(c *Client) {
 /* ================= FORWARD ================= */
 
 func forward(sender *Client, pcm []float32) {
-	defer atomic.StoreInt32(&sender.mlBusy, 0)
 
 	/* ---------- RAW AUDIO (SAME LANG) ---------- */
 
