@@ -126,10 +126,15 @@ class PCMProcessor extends AudioWorkletProcessor {
       output[i] = y;
     }
 
-    // Only send if there's voice activity (saves bandwidth & reduces noise)
-    if (this.isVoiceActive || this.envelope > 0.01) {
+    // Only send if there's active voice (not just the release tail)
+    // Sending during envelope release causes silence-heavy chunks → hallucination
+    if (this.isVoiceActive) {
+      this.port.postMessage(output);
+    } else if (this.envelope > 0.1) {
+      // Small release tail (only above 10% gain) to avoid clipping the end of words
       this.port.postMessage(output);
     }
+    // Below 10% envelope → don't send (prevents silence-heavy audio reaching ML)
 
     return true;
   }

@@ -53,21 +53,26 @@ type AudioState struct {
 const (
 	SAMPLE_RATE = 16000
 
-	// Minimum audio before we'll even consider sending (1.5s — fast response)
-	MIN_SAMPLES = SAMPLE_RATE * 3 / 2
+	// Minimum audio before we'll even consider sending (2s — avoids short hallucination-prone clips)
+	MIN_SAMPLES = SAMPLE_RATE * 2
 
-	// Maximum audio buffer before forced send (6s — keeps utterances short)
-	MAX_SAMPLES = SAMPLE_RATE * 6
+	// Maximum audio buffer before forced send (8s — keeps utterances manageable)
+	MAX_SAMPLES = SAMPLE_RATE * 8
 
 	// How much silence (in frames) triggers end-of-utterance flush
-	// Each frame from the frontend ≈ 2560 samples = 160ms
-	SILENCE_FRAMES_THRESHOLD = 3 // ~0.5s of silence → sentence boundary
+	// Each frame from the frontend ≈ 6400 samples = 400ms
+	// 4 frames ≈ 1.6s of silence → confident sentence boundary
+	SILENCE_FRAMES_THRESHOLD = 4
 
 	// RMS threshold for "silence" detection
 	SILENCE_RMS = float64(0.008)
 
-	// Max time before forced flush even if still speaking (8s)
-	MAX_BUFFER_DURATION = 8 * time.Second
+	// Minimum RMS energy for the entire buffer to be worth sending
+	// Prevents sending buffers that are mostly silence with a tiny bit of speech
+	MIN_BUFFER_RMS = float64(0.005)
+
+	// Max time before forced flush even if still speaking (10s)
+	MAX_BUFFER_DURATION = 10 * time.Second
 )
 
 var (
@@ -192,6 +197,42 @@ func handleAudio(c *Client, data []byte) {
 	state.samples = state.samples[:0]
 	state.silenceFrames = 0
 	state.lastSendTime = time.Now()
+
+	// Check overall buffer energy — reject if mostly silence
+	var bufferSumSq float64
+	for _, s := range audio {
+		bufferSumSq += float64(s) * float64(s)
+	}
+	bufferRMS := math.Sqrt(bufferSumSq / float64(len(audio)))
+	if bufferRMS < MIN_BUFFER_RMS {
+		log.Printf("Skipping %d samples (%.1fs) — buffer too quiet (RMS=%.5f)", len(audio), float64(len(audio))/float64(SAMPLE_RATE), bufferRMS)
+		mu.Unlock()
+		return
+	}
+
+	// Trim trailing silence from the buffer to give ML cleaner audio
+	trimIdx := len(audio)
+	windowSize := 1600 // 100ms windows
+	for trimIdx > MIN_SAMPLES {
+		end := trimIdx
+		start := end - windowSize
+		if start < 0 {
+			break
+		}
+		var winSumSq float64
+		for _, s := range audio[start:end] {
+			winSumSq += float64(s) * float64(s)
+		}
+		winRMS := math.Sqrt(winSumSq / float64(windowSize))
+		if winRMS >= SILENCE_RMS {
+			break
+		}
+		trimIdx -= windowSize
+	}
+	if trimIdx < len(audio) && trimIdx >= MIN_SAMPLES {
+		audio = audio[:trimIdx]
+	}
+
 	atomic.StoreInt32(&c.mlBusy, 1)
 	mu.Unlock()
 

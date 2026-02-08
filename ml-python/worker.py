@@ -5,6 +5,7 @@ import re
 import time
 import asyncio
 import concurrent.futures
+import threading
 import numpy as np
 import soundfile as sf
 import torch
@@ -27,12 +28,16 @@ SAMPLE_RATE = 16000
 
 vad_model = load_silero_vad()
 
+# Silero VAD TorchScript model is NOT thread-safe — concurrent calls
+# corrupt internal state → "tensor does not have a device" crash.
+# Serialize all VAD calls through this lock.
+vad_lock = threading.Lock()
+
 # Thread pool for parallel OpenAI API calls (translate + TTS concurrently)
 api_executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
 
-# Per-room context for Whisper prompts (last N transcripts)
-room_context: dict[str, list[str]] = defaultdict(list)
-MAX_CONTEXT = 5  # keep last 5 transcripts for prompt context
+# Per-room dedup: track last transcript to prevent repetition
+room_last_transcript: dict[str, str] = defaultdict(str)
 
 # ================= AUDIO HELPERS =================
 
@@ -61,25 +66,31 @@ def light_bandpass(pcm: np.ndarray) -> np.ndarray:
 def extract_speech_segments(pcm: np.ndarray) -> tuple[np.ndarray, bool]:
     """Use Silero VAD to extract only speech segments from the audio.
     Returns (speech_pcm, has_speech) — combines the old has_real_speech
-    and extract_speech_segments into ONE VAD pass to cut latency."""
+    and extract_speech_segments into ONE VAD pass to cut latency.
+    
+    NOTE: Silero VAD TorchScript model is NOT thread-safe, so all calls
+    are serialized through vad_lock."""
     audio = torch.from_numpy(pcm)
 
-    timestamps = get_speech_timestamps(
-        audio,
-        vad_model,
-        sampling_rate=SAMPLE_RATE,
-        threshold=0.45,
-        min_speech_duration_ms=200,
-        min_silence_duration_ms=300,
-        speech_pad_ms=150,
-    )
+    with vad_lock:
+        # Reset model state before each call to prevent cross-request leakage
+        vad_model.reset_states()
+        timestamps = get_speech_timestamps(
+            audio,
+            vad_model,
+            sampling_rate=SAMPLE_RATE,
+            threshold=0.5,               # stricter voice confidence (was 0.45)
+            min_speech_duration_ms=300,   # min 300ms speech segment (was 200ms)
+            min_silence_duration_ms=400,  # need 400ms silence to split (was 300ms)
+            speech_pad_ms=200,            # pad speech segments (was 150ms)
+        )
 
     if not timestamps:
         return np.array([], dtype=np.float32), False
 
-    # Check voiced ratio
+    # Check voiced ratio — need at least 15% of audio to be speech
     voiced = sum(t["end"] - t["start"] for t in timestamps)
-    if (voiced / len(pcm)) < 0.10:
+    if (voiced / len(pcm)) < 0.15:
         return np.array([], dtype=np.float32), False
 
     # Concatenate speech segments
@@ -106,12 +117,40 @@ HALLUCINATION_PATTERNS = [
     r"^\(.*\)$",           # (Music), (Applause), etc.
     r"^\.+$",              # Just periods
     r"^[\s\.\,\!\?]+$",   # Just punctuation
+    r"(.{5,}?)\1{2,}",    # Any phrase 5+ chars repeated 3+ times
+    r"^(you|I|the|a|an|is|it|this|that|and|or|but)\s*[\.\!\?]?$",  # single common words
+    r"^(subtitle|caption|translated|translation|srt|sub)s?\s*[\.\!\?:]*$",
 ]
 
 HALLUCINATION_RE = [re.compile(p, re.IGNORECASE) for p in HALLUCINATION_PATTERNS]
 
 
-def is_valid_transcript(text: str) -> bool:
+def ngram_repetition_score(text: str, n: int = 3) -> float:
+    """Check if text has repeating n-gram phrases — a hallucination signature."""
+    words = text.lower().split()
+    if len(words) < n * 2:
+        return 0.0
+    ngrams = [tuple(words[i:i+n]) for i in range(len(words) - n + 1)]
+    if not ngrams:
+        return 0.0
+    from collections import Counter
+    counts = Counter(ngrams)
+    most_common_count = counts.most_common(1)[0][1]
+    return most_common_count / len(ngrams)
+
+
+def text_similarity(a: str, b: str) -> float:
+    """Simple word-overlap similarity between two texts."""
+    if not a or not b:
+        return 0.0
+    wa = set(a.lower().split())
+    wb = set(b.lower().split())
+    if not wa or not wb:
+        return 0.0
+    return len(wa & wb) / max(len(wa), len(wb))
+
+
+def is_valid_transcript(text: str, room: str = "") -> bool:
     text = text.strip()
 
     if len(text) < 3:
@@ -119,13 +158,18 @@ def is_valid_transcript(text: str) -> bool:
 
     # Check hallucination patterns
     for pat in HALLUCINATION_RE:
-        if pat.match(text):
+        if pat.search(text):
+            print(f"[ML] Hallucination pattern match: '{text}'")
             return False
 
     words = text.split()
 
     # Single-word is usually hallucination for short audio
-    if len(words) == 1 and len(text) < 10:
+    if len(words) == 1 and len(text) < 15:
+        return False
+
+    # Two words that are very short — often hallucination
+    if len(words) <= 2 and len(text) < 8:
         return False
 
     # Repetition hallucination: same word/phrase repeated many times
@@ -134,17 +178,32 @@ def is_valid_transcript(text: str) -> bool:
         if len(unique_words) <= 2:
             return False
 
-    # Check for excessive repetition of any single word (> 60% of text)
+    # Check for excessive repetition of any single word (> 50% of text)
     if len(words) > 3:
         from collections import Counter
         word_counts = Counter(w.lower().strip(".,!?") for w in words)
         most_common_count = word_counts.most_common(1)[0][1]
-        if most_common_count / len(words) > 0.6:
+        if most_common_count / len(words) > 0.5:
             return False
+
+    # N-gram repetition check (catches "I am going I am going I am going")
+    if len(words) > 6:
+        for n in (2, 3, 4):
+            if ngram_repetition_score(text, n) > 0.4:
+                print(f"[ML] N-gram repetition detected (n={n}): '{text}'")
+                return False
 
     # Garbage symbols
     if not any(c.isalpha() for c in text):
         return False
+
+    # Dedup: check if this is too similar to the last transcript from this room
+    if room and room in room_last_transcript:
+        last = room_last_transcript[room]
+        sim = text_similarity(text, last)
+        if sim > 0.85 and text.lower().strip(".,!? ") == last.lower().strip(".,!? "):
+            print(f"[ML] Exact dedup with last transcript: '{text}'")
+            return False
 
     return True
 
@@ -241,14 +300,10 @@ def translate_and_tts(text: str, src: str, tgt: str) -> dict | None:
 async def cleanup_task():
     async def loop():
         while True:
-            await asyncio.sleep(30)
-            now = time.time()
-            stale_rooms = [
-                r for r, ctx in room_context.items()
-                if not ctx  # empty context
-            ]
-            for r in stale_rooms:
-                del room_context[r]
+            await asyncio.sleep(60)
+            # Clean up stale dedup entries (rooms with no recent activity)
+            # In production, track timestamps; for now just keep it simple
+            pass
     asyncio.create_task(loop())
 
 
@@ -260,8 +315,8 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
     print(f"[ML] Processing {duration:.1f}s audio from room={room} lang={speaker_lang}")
 
     # 1. Quick energy gate (skip silence immediately)
-    if rms_energy(pcm) < 0.003:
-        print("[ML] Rejected: too quiet")
+    if rms_energy(pcm) < 0.005:
+        print("[ML] Rejected: too quiet (RMS < 0.005)")
         return []
 
     # 2. Lightweight bandpass (frontend already does heavy filtering)
@@ -269,21 +324,20 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
 
     # 3. Single VAD pass — extracts speech segments AND checks validity
     speech_pcm, has_speech = extract_speech_segments(pcm)
-    if not has_speech or len(speech_pcm) < SAMPLE_RATE * 0.3:
-        print("[ML] Rejected: no real speech detected")
+    if not has_speech or len(speech_pcm) < SAMPLE_RATE * 0.5:
+        print("[ML] Rejected: no real speech detected or too short")
+        return []
+
+    # Reject if speech is too short after VAD (< 0.8s of actual speech → hallucination risk)
+    speech_duration = len(speech_pcm) / SAMPLE_RATE
+    if speech_duration < 0.8:
+        print(f"[ML] Rejected: speech too short after VAD ({speech_duration:.2f}s)")
         return []
 
     wav = pcm_to_wav(speech_pcm)
 
-    # 4. Build context-aware prompt for Whisper
-    context_prompt = ""
-    if room in room_context and room_context[room]:
-        recent = room_context[room][-3:]
-        context_prompt = " ".join(recent)
-        if len(context_prompt) > 200:
-            context_prompt = context_prompt[-200:]
-
-    # 5. ASR (fastest OpenAI transcription model)
+    # 4. ASR — NO context prompt. Previous transcripts as prompt cause Whisper
+    #    to hallucinate/repeat old sentences, especially across languages.
     t_asr = time.perf_counter()
     asr_kwargs = {
         "file": ("audio.wav", wav),
@@ -291,24 +345,20 @@ def process_audio(room: str, speaker_lang: str, pcm: np.ndarray):
         "language": speaker_lang,
         "temperature": 0.0,
     }
-    if context_prompt:
-        asr_kwargs["prompt"] = context_prompt
 
     tr = client.audio.transcriptions.create(**asr_kwargs)
     text = tr.text.strip()
     print(f"[ML] ASR took {time.perf_counter() - t_asr:.2f}s → '{text}'")
 
-    # 6. Text sanity gate
-    if not is_valid_transcript(text):
+    # 5. Text sanity gate
+    if not is_valid_transcript(text, room=room):
         print(f"[ML] Rejected transcript: '{text}'")
         return []
 
-    # 7. Update room context
-    room_context[room].append(text)
-    if len(room_context[room]) > MAX_CONTEXT:
-        room_context[room] = room_context[room][-MAX_CONTEXT:]
+    # 6. Update dedup tracking (context no longer used for prompts but kept for dedup)
+    room_last_transcript[room] = text
 
-    # 8. Translate + TTS in PARALLEL for each target language
+    # 7. Translate + TTS in PARALLEL for each target language
     t_mt = time.perf_counter()
     target_langs = [lang for lang in ("en", "hi") if lang != speaker_lang]
 

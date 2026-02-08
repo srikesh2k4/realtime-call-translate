@@ -214,7 +214,8 @@ export default function App() {
 
       let buffers: Float32Array[] = [];
       let size = 0;
-      const TARGET = 2560; // ~160ms chunks — faster streaming to backend
+      const TARGET = 6400; // ~400ms chunks — larger chunks reduce hallucination risk
+      const MIN_RMS = 0.005; // minimum energy to send (skip silence)
 
       worklet.port.onmessage = e => {
         if (!(e.data instanceof Float32Array)) return;
@@ -230,7 +231,18 @@ export default function App() {
             merged.set(b, offset);
             offset += b.length;
           }
-          ws.send(merged.buffer);
+
+          // Energy gate: skip sending if the chunk is mostly silence
+          let sumSq = 0;
+          for (let i = 0; i < merged.length; i++) {
+            sumSq += merged[i] * merged[i];
+          }
+          const rms = Math.sqrt(sumSq / merged.length);
+
+          if (rms > MIN_RMS) {
+            ws.send(merged.buffer);
+          }
+
           buffers = [];
           size = 0;
         }
